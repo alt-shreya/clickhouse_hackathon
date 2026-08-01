@@ -73,6 +73,7 @@ def parse_llm_json(raw_text: str):
     return json.loads(cleaned)
 
 
+
 def run_audit(client, llm_call_fn):
     rows = fetch_current_rows(client)
     if not rows:
@@ -132,3 +133,5 @@ if __name__ == "__main__":
         raise NotImplementedError("Wire this function to your LLM completion provider.")
 
     run_audit(client, llm_call_fn)
+
+

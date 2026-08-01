@@ -2,7 +2,8 @@
 Instrumentation Agent
 Turns feature specs into production-ready ClickHouse schemas.
 Uses ContextAgent for base context, meta_context_registry for existing table metadata,
-and OpenRouter LLM for intelligent schema generation.
+and OpenRouter LLM for intelligent schema generation. Integrates with ContextAgent to 
+update Tier 1 and Tier 2 metadata when new schemas are created.
 """
 
 from pathlib import Path
@@ -13,7 +14,6 @@ import re
 import clickhouse_connect
 
 from agents.tracing.agent import get_tracer
-
 
 
 @dataclass
@@ -119,6 +119,7 @@ class InstrumentationAgent:
     4. Generate ClickHouse schema with proper partitioning, ordering, codecs
     5. Validate against existing tables and best practices
     6. Emit DDL + register in meta_context_registry
+    7. Invoke ContextAgent to trigger update_context for new tables
     """
     
     def __init__(
@@ -155,10 +156,13 @@ class InstrumentationAgent:
     
     def load_context(self) -> Dict[str, Any]:
         """Load all context: base_context.md + meta_context_registry + agent_control."""
-        # 1. Base context from markdown
+        # 1. Base context from markdown or ContextAgent
         if self.context_agent:
-            self.context_agent.load_context()
-            self._context_cache = self.context_agent.get_context_for_agent("instrumentation")
+            if hasattr(self.context_agent, "get_latest_context"):
+                self._context_cache = self.context_agent.get_latest_context()
+            elif hasattr(self.context_agent, "load_context"):
+                self.context_agent.load_context()
+                self._context_cache = self.context_agent.get_context_for_agent("instrumentation")
         
         # 2. Existing tables from registry
         if self.client:
@@ -234,7 +238,7 @@ class InstrumentationAgent:
             metrics = self._context_cache.get("metrics", {})
             issues = self._context_cache.get("issues", [])
             
-            parts.append("=== BASE CONTEXT (from base_context.md) ===")
+            parts.append("=== BASE CONTEXT ===")
             parts.append(f"Entities ({len(entities)}):")
             for name, e in entities.items():
                 parts.append(f"  - {name}: {e.get('description', '')[:100]}")
@@ -306,11 +310,9 @@ class InstrumentationAgent:
             
             return analysis
 
-    
     def _analyze_with_llm(self, spec_md: str, events_sample: List[Dict]) -> SpecAnalysis:
         """Use LLM to analyze spec and extract structured info."""
         if not self._llm_client:
-            # Fallback: basic parsing
             return self._basic_parse(spec_md, events_sample)
         
         prompt = self._build_analysis_prompt(spec_md, events_sample)
@@ -329,7 +331,6 @@ class InstrumentationAgent:
             
             content = (response.choices[0].message.content or "").strip()
 
-            # Strip code fences if the model added them.
             if content.startswith("```json"):
                 content = content[7:]
             elif content.startswith("```"):
@@ -341,7 +342,6 @@ class InstrumentationAgent:
             try:
                 parsed = json.loads(content)
             except json.JSONDecodeError:
-                # Recover the first JSON object if the model added stray text
                 start = content.find("{")
                 end = content.rfind("}")
                 if start == -1 or end == -1 or end <= start:
@@ -383,7 +383,6 @@ Focus on:
 
     def _build_analysis_prompt(self, spec_md: str, events_sample: List[Dict]) -> str:
         context = self.get_context_summary()
-        
         events_json = json.dumps(events_sample, indent=2, default=str) if events_sample else "[]"
         
         return f"""Analyze this feature specification and extract schema requirements.
@@ -400,39 +399,26 @@ Extract all entities, events, properties, and relationships. Suggest new table d
 
     def _basic_parse(self, spec_md: str, events_sample: List[Dict]) -> SpecAnalysis:
         """Basic regex-based parsing as fallback."""
-        # Extract feature name from directory or first heading
         feature_name = "unknown"
         match = re.search(r"^#\s+(.+)$", spec_md, re.MULTILINE)
         if match:
             feature_name = match.group(1).lower().replace(" ", "-").replace("_", "-")
         
-        # Extract event names from spec.md
         event_names = []
-        # Look for backtick event names like `express_checkout_shown` - only those with underscores that look like event types
         event_matches = re.findall(r"`(\w+_+\w+)`", spec_md)
-        # Filter: only keep ones that look like event names (not field names like device_type, geoip_country_code)
-        # Event names typically have 2+ underscores or match known patterns
         for m in event_matches:
-            # Skip common field names that appear in backticks
             if m not in ["device_type", "geoip_country_code", "app_version", "user_id", "application_id", 
                          "saved_method_type", "otp_attempts", "otp_success", "shown_amount", "latency_ms"]:
                 event_names.append(m)
-        # Also look for event: "name" pattern
         event_matches2 = re.findall(r'event["\s:]+(\w+_+\w+)', spec_md, re.IGNORECASE)
         event_names.extend(event_matches2)
-        # From events sample - extract actual event field values ONLY
         for e in events_sample:
             if "event" in e:
                 event_names.append(e["event"])
         
-        # Deduplicate
         event_names = list(dict.fromkeys(event_names))
         
-        # Build entities from event properties (not creating tables for each property)
         entities = []
-        events = []
-        
-        # Infer event properties from sample
         event_properties = {}
         for e in events_sample:
             event_type = e.get("event", "unknown")
@@ -450,7 +436,6 @@ Extract all entities, events, properties, and relationships. Suggest new table d
                     event_properties[event_type] = {}
                 event_properties[event_type][key] = prop_type
         
-        # Add entities for each event's properties
         for event_type, props in event_properties.items():
             for prop_name, prop_type in props.items():
                 entities.append({
@@ -460,14 +445,10 @@ Extract all entities, events, properties, and relationships. Suggest new table d
                     "identifiers": []
                 })
         
-        # Create suggested tables from event names (one table per event type)
         suggested_tables = []
         for ename in event_names:
-            # Convert to snake_case table name
             table_name = ename.lower().replace("-", "_")
-            # Determine kind from context or default to supporting
             kind = "supporting"
-            # Check if it's a funnel event based on base context
             funnel_keywords = ["destination_card_clicked", "application_started", "document_uploaded", "purchase_completed"]
             if any(fk in table_name for fk in funnel_keywords):
                 kind = "funnel"
@@ -513,7 +494,6 @@ Extract all entities, events, properties, and relationships. Suggest new table d
                 )
                 
                 content = response.choices[0].message.content.strip()
-                # Strip markdown formatting if present
                 if content.startswith("```json"):
                     content = content[7:]
                 elif content.startswith("```"):
@@ -523,7 +503,6 @@ Extract all entities, events, properties, and relationships. Suggest new table d
                 content = content.strip()
                 
                 parsed = json.loads(content)
-                
                 return self._parse_generated_schemas(parsed)
             except Exception as e:
                 print(f"LLM generation failed: {e}, falling back to basic generation")
@@ -560,7 +539,6 @@ Atlys conventions:
 
     def _build_generation_prompt(self, analysis: SpecAnalysis) -> str:
         context = self.get_context_summary()
-        
         return f"""Generate ClickHouse table schemas for this feature.
 
 {context}
@@ -588,7 +566,6 @@ Generate schemas for any NEW tables needed. Also suggest modifications to existi
 Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integration with existing funnel."""
 
     def _parse_generated_schemas(self, parsed: Dict) -> List[TableSchema]:
-        """Parse LLM-generated schema JSON into TableSchema objects."""
         schemas = []
         for t in parsed.get("tables", []):
             columns = []
@@ -620,11 +597,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         return schemas
     
     def _basic_generate(self, analysis: SpecAnalysis) -> List[TableSchema]:
-        """Basic schema generation fallback."""
-        # Create one table per suggested table or inferred from events
         schemas = []
-        
-        # If no suggested tables, create one based on feature name
         if not analysis.suggested_tables and analysis.events:
             for event in analysis.events:
                 event_name = event.get("name", "").lower().replace(" ", "_")
@@ -653,8 +626,6 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         return schemas
     
     def _build_basic_columns(self, table_spec: Dict, analysis: SpecAnalysis) -> List[ColumnSpec]:
-        """Build basic columns for a table."""
-        # Standard envelope
         columns = [
             ColumnSpec(name="id", type="UUID", description="Event ID"),
             ColumnSpec(name="timestamp", type="DateTime", description="Event timestamp"),
@@ -688,9 +659,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             ColumnSpec(name="duplicate_id", type="String", description="Deduplication ID", nullable=True),
         ]
         
-        # Add event-specific columns from analysis
         for entity in analysis.entities:
-            # Only add properties that belong to this specific event table
             entity_name = entity.get("name", "")
             if "." in entity_name:
                 entity_event = entity_name.split(".")[0].lower().replace("-", "_")
@@ -700,7 +669,6 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             for prop in entity.get("properties", []):
                 col_name = prop.get("name", "").lower().replace(" ", "_")
                 col_type = prop.get("type", "String")
-                # Map common types
                 type_map = {
                     "string": "String",
                     "int": "Int64",
@@ -713,7 +681,6 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
                 }
                 ch_type = type_map.get(col_type.lower(), col_type)
                 
-                # Check if already in envelope
                 if not any(c.name == col_name for c in columns):
                     columns.append(ColumnSpec(
                         name=col_name,
@@ -735,37 +702,31 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         """Validate schema against best practices and existing tables."""
         issues = []
         
-        # 1. Check required envelope columns
         envelope_cols = {"id", "timestamp", "user_id", "application_id"}
         schema_cols = {c.name for c in schema.columns}
         missing = envelope_cols - schema_cols
         if missing:
             issues.append(f"Missing envelope columns: {missing}")
         
-        # 2. Check partition_by
         if not schema.partition_by:
             issues.append("Missing partition_by (recommend: toYYYYMM(timestamp))")
         elif "timestamp" not in schema.partition_by:
             issues.append("partition_by should reference timestamp")
         
-        # 3. Check order_by
         if not schema.order_by:
             issues.append("Missing order_by (recommend: id, timestamp, user_id)")
         elif "id" not in schema.order_by or "timestamp" not in schema.order_by:
             issues.append("order_by should include id and timestamp")
         
-        # 4. Check for duplicate column names
         col_names = [c.name for c in schema.columns]
         dupes = set([x for x in col_names if col_names.count(x) > 1])
         if dupes:
             issues.append(f"Duplicate column names: {dupes}")
         
-        # 5. Check against existing tables for conflicts
         for existing_name, existing in self._existing_tables.items():
             if existing_name == schema.name:
                 issues.append(f"Table {schema.name} already exists in registry (version {existing.get('version', '?')})")
         
-        # 6. Check LowCardinality usage
         for col in schema.columns:
             if col.low_cardinality and col.type not in ("String", "LowCardinality(String)"):
                 issues.append(f"LowCardinality only works with String types: {col.name}")
@@ -777,7 +738,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         return {name: self.validate_schema(schema) for name, schema in self.schemas.items()}
     
     # ============================================================
-    # Registry Operations
+    # Registry & Context Agent Operations
     # ============================================================
     
     def register_table(self, schema: TableSchema, version: int = 1) -> bool:
@@ -786,7 +747,6 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             print("No ClickHouse client, skipping registry")
             return False
         
-        # Convert columns to JSON array format
         columns_json = json.dumps([{
             "name": c.name,
             "type": c.type,
@@ -825,13 +785,51 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
     def register_all(self) -> Dict[str, bool]:
         """Register all generated schemas."""
         return {name: self.register_table(schema) for name, schema in self.schemas.items()}
-    
+
+    def execute_and_update_context(self, source_spec: str = "") -> Dict[str, Any]:
+        """
+        Executes DDL statements to create generated tables in ClickHouse,
+        registers them in meta_context_registry, and invokes ContextAgent.update_context()
+        to produce Tier 1 native comments and Tier 2 business rules.
+        """
+        results = {}
+        for schema_name, schema in self.schemas.items():
+            ddl = schema.to_ddl(self.database)
+            
+            # Execute CREATE TABLE on ClickHouse
+            if self.client:
+                try:
+                    self.client.command(ddl)
+                    print(f"Executed DDL for table {schema_name}")
+                except Exception as e:
+                    print(f"Failed to execute DDL for table {schema_name}: {e}")
+            
+            # Register in meta_context_registry
+            registered = self.register_table(schema)
+            
+            # Invoke ContextAgent integration contract
+            next_version = None
+            if self.context_agent and hasattr(self.context_agent, "update_context"):
+                print(f"Invoking ContextAgent.update_context for {schema_name}...")
+                next_version = self.context_agent.update_context(
+                    new_table=schema_name,
+                    schema_ddl=ddl,
+                    source_spec=source_spec,
+                )
+            
+            results[schema_name] = {
+                "registered": registered,
+                "context_version": next_version,
+            }
+            
+        return results
+
     # ============================================================
     # Full Pipeline
     # ============================================================
     
-    def process_spec(self, spec_dir: Path) -> List[TableSchema]:
-        """Full pipeline: spec -> analysis -> schemas -> validation -> register."""
+    def process_spec(self, spec_dir: Path, execute_ddl: bool = True) -> List[TableSchema]:
+        """Full pipeline: spec -> analysis -> schemas -> validation -> register -> update_context."""
         with get_tracer().trace_span("instrumentation.process_spec", input_data={"spec_dir": str(spec_dir)}):
             print(f"Processing spec: {spec_dir}")
             
@@ -858,8 +856,9 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
                 else:
                     print(f"  {name}: OK")
             
-            # 5. Register (optional - uncomment to enable)
-            # self.register_all()
+            # 5. Execute DDL, Register, and Update Context
+            if execute_ddl:
+                self.execute_and_update_context(source_spec=analysis.raw_spec_md)
             
             return schemas
     

@@ -1,357 +1,270 @@
 """
-Context Agent
-Maintains living context layer, feeds it to other agents.
+ContextAgent -- the single object every other agent talks to for context.
+Fixed interface: load_v1, get_latest_context, update_context, run_audit, resolve_flag.
 """
 
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from dataclasses import dataclass, field
 import json
 import re
+import clickhouse_connect
+from .load_base_context import ROWS, build_insert_rows
+from .audit_base_context import fetch_current_rows, cross_check_against_schema, AUDIT_PROMPT
 
-from agents.tracing.agent import get_tracer
+UPDATE_PROMPT = """A new ClickHouse table has been created for a feature spec.
+Given its DDL and the spec description, produce TWO separate lists:
+
+1. "schema_comments": one short semantic description per column, plus one for
+   the table's overall role -- this is Tier 1, schema-native metadata, applied
+   as native COMMENT ON TABLE/COLUMN statements. Purely descriptive facts about
+   what a field captures.
+2. "business_rules": ONLY include an entry here if the spec implies something
+   that is NOT just "what a column means" -- e.g. a new metric formula, a new
+   known-issue-style caveat, or a new join relationship to an existing table.
+   Leave this empty if nothing qualifies; most new tables won't need one.
+
+Respond as JSON: {{"schema_comments": {{"table": "<desc>", "<col>": "<desc>", ...}},
+"business_rules": [{{"key": "...", "value": "...", "value_type": "metric_definition|business_rule|entity_relationship"}}]}}
+No prose, no markdown fences.
+
+SPEC: {source_spec}
+DDL:
+{schema_ddl}
+"""
+
+RESOLVE_PROMPT = """You are resolving an open context flag in an analytics system.
+Flag Description: {description}
+Current Related Context Rows:
+{conflicting_rows}
+
+Provide a single, corrected context value that unifies or supersedes these rules.
+Respond in JSON: {{"resolved_value": "...", "resolution_notes": "..."}}
+No prose, no markdown fences.
+"""
 
 
-
-@dataclass
-class EntityDefinition:
-    """Business entity definition from context layer."""
-    name: str
-    description: str
-    tables: List[str] = field(default_factory=list)
-    key_columns: List[str] = field(default_factory=list)
-    relationships: Dict[str, str] = field(default_factory=dict)  # entity -> relationship type
-
-
-@dataclass
-class MetricDefinition:
-    """Business metric definition with formula."""
-    name: str
-    description: str
-    formula: str
-    unit: str = ""
-    depends_on: List[str] = field(default_factory=list)
-
-
-@dataclass
-class KnownIssue:
-    """Known data quality or definition issue."""
-    id: str
-    description: str
-    affected_tables: List[str]
-    severity: str = "medium"
-    workaround: str = ""
-    status: str = "open"  # open, acknowledged, fixed
+def parse_llm_json(raw_text: str):
+    """Safely extracts JSON even if the LLM wraps it in markdown blocks or extra whitespace."""
+    cleaned = raw_text.strip()
+    match = re.search(r'(\{.*\}|\[.*\])', cleaned, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+    return json.loads(cleaned)
 
 
 class ContextAgent:
-    """Agent that maintains and serves the living business context layer."""
-    
-    def __init__(self, context_path: str = None, clickhouse_client=None):
-        self.context_path = context_path or "base_context.md"
-        self.client = clickhouse_client
-        self.entities: Dict[str, EntityDefinition] = {}
-        self.metrics: Dict[str, MetricDefinition] = {}
-        self.issues: Dict[str, KnownIssue] = {}
-        self.raw_context: str = ""
-        self._last_parsed: Optional[str] = None
-    
-    def load_context(self) -> str:
-        """Load and parse the context file."""
-        with get_tracer().trace_span("context.load_context", input_data={"path": self.context_path}):
-            path = Path(self.context_path)
-            if not path.exists():
-                raise FileNotFoundError(f"Context file not found: {self.context_path}")
-            
-            self.raw_context = path.read_text()
-            self._parse_context()
-            self.sync_to_db()
-            return self.raw_context
-    
-    def _parse_context(self):
-        """Parse base_context.md into structured data."""
-        content = self.raw_context
-        
-        # Extract entities section
-        entity_section = self._extract_section(content, "## 2. Entity definitions", "## 3. The eight raw event tables")
-        if entity_section:
-            self._parse_entities(entity_section)
-        
-        # Extract metrics section
-        metric_section = self._extract_section(content, "## 4. Metric definitions", "## 5. Known-issues log")
-        if metric_section:
-            self._parse_metrics(metric_section)
-        
-        # Extract issues section
-        issues_section = self._extract_section(content, "## 5. Known-issues log", "## 6. Entity relationships")
-        if issues_section:
-            self._parse_issues(issues_section)
-    
-    def _extract_section(self, content: str, start_marker: str, end_marker: Optional[str]) -> Optional[str]:
-        """Extract a section between two markers."""
-        start_idx = content.find(start_marker)
-        if start_idx == -1:
-            return None
-        start_idx = content.find("\n", start_idx) + 1
-        
-        if end_marker:
-            end_idx = content.find(end_marker, start_idx)
-            if end_idx == -1:
-                return content[start_idx:]
-            return content[start_idx:end_idx]
-        return content[start_idx:]
-    
-    def _parse_entities(self, section: str):
-        """Parse entity definitions from markdown."""
-        # Pattern: **Entity Name** — description\n\n**Tables:** table1, table2\n**Key Columns:** col1, col2
-        # Split by double asterisks at start of line
-        entity_blocks = re.split(r'\n\*\*([^*]+)\*\*', section)
-        
-        # First element is before first entity, skip it
-        for i in range(1, len(entity_blocks), 2):
-            name = entity_blocks[i].strip()
-            body = entity_blocks[i + 1] if i + 1 < len(entity_blocks) else ""
-            
-            tables = []
-            key_cols = []
-            relationships = {}
-            
-            tables_match = re.search(r"\*\*Tables:\*\*\s*(.+)", body)
-            if tables_match:
-                tables = [t.strip() for t in tables_match.group(1).split(",")]
-            
-            keys_match = re.search(r"\*\*Key Columns:\*\*\s*(.+)", body)
-            if keys_match:
-                key_cols = [k.strip() for k in keys_match.group(1).split(",")]
-            
-            rel_match = re.search(r"\*\*Relationships:\*\*\s*(.+)", body)
-            if rel_match:
-                for rel in rel_match.group(1).split(","):
-                    parts = rel.split("->")
-                    if len(parts) == 2:
-                        relationships[parts[0].strip()] = parts[1].strip()
-            
-            # Description is everything before **Tables:
-            desc = body.split("**Tables:**")[0].strip()
-            # Clean up the leading em dash
-            if desc.startswith("—"):
-                desc = desc[1:].strip()
-            
-            self.entities[name] = EntityDefinition(
-                name=name,
-                description=desc,
-                tables=tables,
-                key_columns=key_cols,
-                relationships=relationships
-            )
-    
-    def _parse_metrics(self, section: str):
-        """Parse metric definitions from markdown."""
-        # Pattern: **Metric Name** = formula. Description.
-        # **Unit:** unit
-        # **Depends On:** dep1, dep2
-        metric_blocks = re.split(r'\n\*\*([^*]+)\*\*\s*=', section)
-        
-        for i in range(1, len(metric_blocks), 2):
-            name = metric_blocks[i].strip()
-            body = "=" + metric_blocks[i + 1] if i + 1 < len(metric_blocks) else ""
-            
-            formula = ""
-            unit = ""
-            depends = []
-            
-            # Extract formula (everything before first period or newline)
-            formula_match = re.search(r"^(.+?)(?:\.|\n)", body)
-            if formula_match:
-                formula = formula_match.group(1).strip()
-            
-            unit_match = re.search(r"\*\*Unit:\*\*\s*(.+)", body)
-            if unit_match:
-                unit = unit_match.group(1).strip()
-            
-            dep_match = re.search(r"\*\*Depends On:\*\*\s*(.+)", body)
-            if dep_match:
-                depends = [d.strip() for d in dep_match.group(1).split(",")]
-            
-            # Description is the rest
-            desc = body.split(formula)[-1].strip() if formula in body else body
-            desc = desc.lstrip(". ").strip()
-            
-            self.metrics[name] = MetricDefinition(
-                name=name,
-                description=desc,
-                formula=formula,
-                unit=unit,
-                depends_on=depends
-            )
-    
-    def _parse_issues(self, section: str):
-        """Parse known issues from markdown."""
-        # Pattern: 1. **K1 — Title.** Description. **Affected Tables:** table1, table2
-        # **Severity:** severity
-        # **Workaround:** workaround
-        issue_blocks = re.split(r'\n\d+\.\s+\*\*([^*]+)\*\*', section)
-        
-        for i in range(1, len(issue_blocks), 2):
-            header = issue_blocks[i].strip()
-            body = issue_blocks[i + 1] if i + 1 < len(issue_blocks) else ""
-            
-            # Extract issue ID and title from header like "K1 — iOS WebKit OTP autofill regression."
-            parts = header.split("—", 1)
-            issue_id = parts[0].strip().lower().replace(" ", "-")
-            title = parts[1].strip() if len(parts) > 1 else ""
-            
-            affected = []
-            severity = "medium"
-            workaround = ""
-            
-            affected_match = re.search(r"\*\*Affected Tables:\*\*\s*(.+)", body)
-            if affected_match:
-                affected = [t.strip() for t in affected_match.group(1).split(",")]
-            
-            sev_match = re.search(r"\*\*Severity:\*\*\s*(.+)", body)
-            if sev_match:
-                severity = sev_match.group(1).strip().lower()
-            
-            work_match = re.search(r"\*\*Workaround:\*\*\s*(.+)", body)
-            if work_match:
-                workaround = work_match.group(1).strip()
-            
-            # Description is everything before **Affected Tables:
-            desc = body.split("**Affected Tables:**")[0].strip()
-            # Combine title and description
-            if title:
-                desc = f"{title}. {desc}"
-            
-            self.issues[issue_id] = KnownIssue(
-                id=issue_id,
-                description=desc,
-                affected_tables=affected,
-                severity=severity,
-                workaround=workaround
-            )
-    
-    def get_entity(self, name: str) -> Optional[EntityDefinition]:
-        """Get entity definition by name (fuzzy match)."""
-        name_lower = name.lower()
-        for key, entity in self.entities.items():
-            if key.lower() == name_lower or name_lower in key.lower():
-                return entity
-        return None
-    
-    def get_metric(self, name: str) -> Optional[MetricDefinition]:
-        """Get metric definition by name."""
-        name_lower = name.lower()
-        for key, metric in self.metrics.items():
-            if key.lower() == name_lower:
-                return metric
-        return None
-    
-    def get_issues_for_table(self, table: str) -> List[KnownIssue]:
-        """Get all known issues affecting a table."""
-        return [issue for issue in self.issues.values() if table in issue.affected_tables]
-    
-    def get_context_for_agent(self, agent_type: str) -> Dict[str, Any]:
-        """Get relevant context subset for a specific agent."""
-        if agent_type == "instrumentation":
-            return {
-                "entities": {k: {"name": v.name, "tables": v.tables, "key_columns": v.key_columns} 
-                           for k, v in self.entities.items()},
-                "metrics": {k: {"name": v.name, "formula": v.formula} for k, v in self.metrics.items()},
-                "issues": [{"id": v.id, "description": v.description, "tables": v.affected_tables} 
-                          for v in self.issues.values()],
-            }
-        elif agent_type == "analytics":
-            return {
-                "metrics": {k: {"name": v.name, "description": v.description, "formula": v.formula, "unit": v.unit} 
-                           for k, v in self.metrics.items()},
-                "issues": [{"id": v.id, "description": v.description, "tables": v.affected_tables, "severity": v.severity} 
-                          for v in self.issues.values()],
-            }
-        elif agent_type == "context":
-            return {
-                "entities": {k: v.__dict__ for k, v in self.entities.items()},
-                "metrics": {k: v.__dict__ for k, v in self.metrics.items()},
-                "issues": {k: v.__dict__ for k, v in self.issues.items()},
-            }
-        return {}
-    
-    def validate_context(self) -> List[str]:
-        """Validate context for consistency issues."""
-        warnings = []
-        
-        # Check for tables referenced in entities but not in DDL
-        # Check for metrics that reference non-existent entities
-        # Check for circular dependencies in metrics
-        
-        for metric in self.metrics.values():
-            for dep in metric.depends_on:
-                if dep not in self.metrics:
-                    warnings.append(f"Metric '{metric.name}' depends on unknown metric '{dep}'")
-        
-        return warnings
-    
-    def export_context(self, output_path: Path, format: str = "json"):
-        """Export context to file."""
-        data = {
-            "entities": {k: v.__dict__ for k, v in self.entities.items()},
-            "metrics": {k: v.__dict__ for k, v in self.metrics.items()},
-            "issues": {k: v.__dict__ for k, v in self.issues.items()},
-        }
-        if format == "json":
-            output_path.write_text(json.dumps(data, indent=2, default=str))
+    def __init__(self, client, llm_call_fn):
+        self.client = client
+        self.llm_call_fn = llm_call_fn  # Wrapped in Langfuse span at call sites
 
-    def sync_to_db(self):
-        """Sync parsed context to agent_control ClickHouse DB."""
-        if not self.client:
+    def load_v1(self) -> int:
+        """Initializes Tier 2 base context into agent_control.context_layer."""
+        records = build_insert_rows(ROWS)
+        self.client.insert(
+            "agent_control.context_layer",
+            [list(r.values()) for r in records],
+            column_names=list(records[0].keys()),
+        )
+        return len(records)
+
+    def get_latest_context(self, entities: list[str] | None = None) -> dict:
+        """Returns a unified view merging both context tiers:
+        - Tier 1: Native COMMENTs on atlys.* tables/columns (metadata)
+        - Tier 2: agent_control.context_layer (metrics, known issues, joins)
+        - Active Flags: Open warnings for the Analytics Agent
+        """
+        tier2 = self._get_tier2(entities)
+        tier1 = self._get_tier1(entities)
+        flags = self._open_flags(entities)
+        max_version = max((r["version"] for r in tier2), default=0)
+        return {
+            "schema_context": tier1,     # Table/column comments from system.columns/tables
+            "business_context": tier2,   # Versioned rows: metrics/known-issues/joins
+            "flags": flags,              # Open contradictions or ambiguities
+            "context_version": max_version,
+        }
+
+    def _get_tier2(self, entities: list[str] | None) -> list[dict]:
+        where = ""
+        if entities:
+            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
+            where = f"WHERE entity IN ({in_list})"
+        query = f"""
+            SELECT entity, key, argMax(value, version) AS value,
+                   argMax(value_type, version) AS value_type,
+                   max(version) AS version
+            FROM agent_control.context_layer
+            {where}
+            GROUP BY entity, key
+            HAVING argMax(change_type, version) != 'deprecation'
+            ORDER BY entity, key
+        """
+        result = self.client.query(query)
+        return [dict(zip(result.column_names, r)) for r in result.result_rows]
+
+    def _get_tier1(self, entities: list[str] | None) -> dict:
+        table_filter = ""
+        col_filter = ""
+        if entities:
+            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
+            table_filter = f"AND name IN ({in_list})"
+            col_filter = f"AND table IN ({in_list})"
+
+        tables = self.client.query(f"""
+            SELECT name AS entity, comment
+            FROM system.tables
+            WHERE database = 'atlys' AND comment != '' {table_filter}
+        """)
+        columns = self.client.query(f"""
+            SELECT table AS entity, name AS column, comment
+            FROM system.columns
+            WHERE database = 'atlys' AND comment != '' {col_filter}
+        """)
+        return {
+            "tables": [dict(zip(tables.column_names, r)) for r in tables.result_rows],
+            "columns": [dict(zip(columns.column_names, r)) for r in columns.result_rows],
+        }
+
+    def _open_flags(self, entities: list[str] | None) -> list[dict]:
+        where = "WHERE status = 'open'"
+        if entities:
+            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
+            where += f" AND entity IN ({in_list})"
+        result = self.client.query(f"""
+            SELECT flag_id, entity, key, flag_type, description
+            FROM agent_control.context_flags {where}
+        """)
+        return [dict(zip(result.column_names, r)) for r in result.result_rows]
+
+    def run_audit(self, scope: list[str] | None = None) -> list[dict]:
+        if scope is None:
+            print("WARNING: run_audit() called with scope=None -- auditing ENTIRE context layer.")
+        
+        rows = fetch_current_rows(self.client) if scope is None else self._get_tier2(entities=scope)
+        if not rows:
+            return []
+
+        prompt = AUDIT_PROMPT.format(rows_json=json.dumps(rows, indent=2, default=str))
+        
+        try:
+            raw = self.llm_call_fn(prompt, span_name="context_audit")
+        except TypeError:
+            raw = self.llm_call_fn(prompt)
+
+        flags = parse_llm_json(raw)
+        if not isinstance(flags, list):
+            flags = [flags] if isinstance(flags, dict) else []
+
+        flags = cross_check_against_schema(self.client, flags)
+
+        if flags:
+            self.client.insert(
+                "agent_control.context_flags",
+                [[f.get("entity", ""), f.get("key", ""), f.get("flag_type", "ambiguous_definition"),
+                  f.get("description", ""), f.get("conflicting_keys", []), "open"] for f in flags],
+                column_names=["entity", "key", "flag_type", "description",
+                              "conflicting_versions", "status"],
+            )
+        return flags
+
+    def update_context(self, new_table: str, schema_ddl: str, source_spec: str) -> int | None:
+        prompt = UPDATE_PROMPT.format(source_spec=source_spec, schema_ddl=schema_ddl)
+        
+        try:
+            raw = self.llm_call_fn(prompt, span_name="context_update")
+        except TypeError:
+            raw = self.llm_call_fn(prompt)
+
+        parsed = parse_llm_json(raw)
+
+        # --- Tier 1: Native ClickHouse Comments ---
+        schema_comments = parsed.get("schema_comments", {})
+        for field, desc in schema_comments.items():
+            desc_escaped = str(desc).replace("'", "''")
+            if field == "table":
+                self.client.command(f"ALTER TABLE atlys.{new_table} MODIFY COMMENT '{desc_escaped}'")
+            else:
+                self.client.command(f"ALTER TABLE atlys.{new_table} COMMENT COLUMN {field} '{desc_escaped}'")
+
+        # --- Tier 2: Business Rules ---
+        business_rules = parsed.get("business_rules", [])
+        next_version = None
+        if business_rules:
+            current = {(r["entity"], r["key"]): r for r in self._get_tier2(None)}
+            next_version = max((r["version"] for r in current.values()), default=1) + 1
+            
+            # Format tuples for build_insert_rows
+            new_tuples = [
+                (new_table, nr["key"], str(nr["value"]), nr.get("value_type", "business_rule"), new_table)
+                for nr in business_rules
+            ]
+            
+            # Generate dicts with updated_at included natively
+            insert_records = build_insert_rows(new_tuples, version=next_version, updated_by="context_agent_llm")
+            
+            # Reconcile overrides for specific updates vs corrections
+            for rec in insert_records:
+                existing = current.get((rec["entity"], rec["key"]))
+                if existing and existing["value"] != rec["value"]:
+                    rec["change_type"] = "correction"
+                    rec["supersedes_version"] = existing["version"]
+            
+            self.client.insert(
+                "agent_control.context_layer",
+                [list(r.values()) for r in insert_records],
+                column_names=list(insert_records[0].keys()),
+            )
+
+        # Re-audit new scope
+        self.run_audit(scope=[new_table])
+        return next_version
+
+    def resolve_flag(self, flag_id: str, entity: str, key: str) -> None:
+        """Resolves an open flag by generating a corrected Tier 2 rule and updating flag status."""
+        flag = self.client.query(
+            f"SELECT description FROM agent_control.context_flags WHERE flag_id = '{flag_id}' AND status = 'open'"
+        ).result_rows
+        if not flag:
             return
 
-        with get_tracer().trace_span("context.sync_to_db"):
-            from datetime import datetime
-            now = datetime.now()
+        conflicting_rows = self._get_tier2(entities=[entity])
+        prompt = RESOLVE_PROMPT.format(description=flag[0][0], conflicting_rows=json.dumps(conflicting_rows))
+        
+        try:
+            raw = self.llm_call_fn(prompt, span_name="context_resolve")
+        except TypeError:
+            raw = self.llm_call_fn(prompt)
+
+        res = parse_llm_json(raw)
+        resolved_value = res.get("resolved_value", "")
+
+        if resolved_value:
+            latest_v = max([r["version"] for r in conflicting_rows], default=1) + 1
             
-            # Sync context_layer
-            layer_data = []
+            # Leverage build_insert_rows to handle correct dict scaffolding and updated_at
+            resolve_tuple = [(entity, key, resolved_value, "business_rule", entity)]
+            resolve_records = build_insert_rows(resolve_tuple, version=latest_v, updated_by="context_agent_resolve")
             
-            version = 1
-            source_table = 'base_context.md'
-            updated_by = 'ContextAgent'
-            change_type = 'initial_sync'
-            confidence = 1.0
+            # Override for correction
+            resolve_records[0]["change_type"] = "correction"
+            resolve_records[0]["supersedes_version"] = latest_v - 1
             
-            for name, entity in self.entities.items():
-                layer_data.append((
-                    version, 'entity', name,
-                    json.dumps({"description": entity.description, "tables": entity.tables, "key_columns": entity.key_columns, "relationships": entity.relationships}),
-                    'json', source_table, updated_by, change_type, None, confidence, now
-                ))
-            for name, metric in self.metrics.items():
-                layer_data.append((
-                    version, 'metric', name,
-                    json.dumps({"description": metric.description, "formula": metric.formula, "unit": metric.unit, "depends_on": metric.depends_on}),
-                    'json', source_table, updated_by, change_type, None, confidence, now
-                ))
-            for i_id, issue in self.issues.items():
-                layer_data.append((
-                    version, 'issue', i_id,
-                    json.dumps({"description": issue.description, "affected_tables": issue.affected_tables, "severity": issue.severity, "workaround": issue.workaround, "status": issue.status}),
-                    'json', source_table, updated_by, change_type, None, confidence, now
-                ))
-            
-            if layer_data:
-                self.client.insert(
-                    'agent_control.context_layer',
-                    layer_data,
-                    column_names=['version', 'entity', 'key', 'value', 'value_type', 'source_table', 'updated_by', 'change_type', 'supersedes_version', 'confidence', 'updated_at']
-                )
-            
-            # Sync context_flags
-            flags_data = [
-                ('system', 'last_context_update', 'update', now.isoformat(), [], 'open', now, None),
-                ('system', 'context_version', 'version', str(version), [], 'open', now, None)
-            ]
             self.client.insert(
-                'agent_control.context_flags',
-                flags_data,
-                column_names=['entity', 'key', 'flag_type', 'description', 'conflicting_versions', 'status', 'detected_at', 'resolved_at']
+                "agent_control.context_layer",
+                [list(r.values()) for r in resolve_records],
+                column_names=list(resolve_records[0].keys())
             )
+
+        self.client.command(
+            f"ALTER TABLE agent_control.context_flags UPDATE status = 'resolved', resolved_at = now() WHERE flag_id = '{flag_id}'"
+        )
+
+
+if __name__ == "__main__":
+    client = clickhouse_connect.get_client(
+        host="<your-service-host>", username="<user>", password="<password>", database="atlys",
+    )
+
+    def llm_call_fn(prompt: str, span_name: str = "test") -> str:
+        raise NotImplementedError("Wire to Anthropic / OpenAI API call")
+
+    agent = ContextAgent(client, llm_call_fn)
+    print("ContextAgent initialized successfully.")
