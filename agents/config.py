@@ -65,7 +65,7 @@ class LangfuseConfig:
 class OpenRouterConfig:
     """OpenRouter LLM configuration."""
     api_key: str = ""
-    model: str = "google/gemma-4-31b-it:free"
+    model: str = "openrouter/free"
     base_url: str = "https://openrouter.ai/api/v1"
     enabled: bool = True
     
@@ -75,7 +75,7 @@ class OpenRouterConfig:
         api_key = os.getenv("OPENROUTER_API_KEY", "")
         return cls(
             api_key=api_key,
-            model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free"),
+            model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             enabled=bool(api_key),
         )
