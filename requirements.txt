@@ -1,23 +1,6 @@
-# Atlys Click-a-thon 2026 - Agent System Dependencies
-
-# Core
-clickhouse-connect>=1.6.0
-
-# Tracing (optional)
-langfuse>=2.0.0
-
-# LLM (OpenRouter - OpenAI compatible)
-openai>=1.0.0
-
-# Data processing
-pandas>=2.0.0
-numpy>=1.24.0
-
-# Utilities
-pyyaml>=6.0
+clickhouse-connect>=0.7.0
+google-genai>=0.1.0
+langfuse>=4.0.0
+pydantic>=2.0.0
 python-dotenv>=1.0.0
-
-# Development
-pytest>=7.0.0
-black>=23.0.0
-ruff>=0.1.0
+rich>=13.0.0
