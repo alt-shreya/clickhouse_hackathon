@@ -1,3 +1,16 @@
+# ClickHouse client -- used directly in load_base_context.py, audit_base_context.py, context_agent.py
+clickhouse-connect>=0.7.19
+
+# Anthropic SDK -- for llm_call_fn (context_audit / context_update calls, and later
+# the Instrumentation/Analytics agents' LLM calls)
+anthropic>=0.39.0
+
+# Langfuse -- required by the problem statement for tracing every LLM call and SQL span
+langfuse>=2.53.0
+
+# python-dotenv -- convenience for loading CLICKHOUSE_*/ANTHROPIC_*/LANGFUSE_* env vars
+# from a local .env instead of hardcoding credentials in scripts
+python-dotenv>=1.0.1
 # Atlys Click-a-thon 2026 - Agent System Dependencies
 
 # Core
