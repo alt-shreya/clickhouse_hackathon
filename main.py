@@ -1,5 +1,6 @@
 import argparse
 import re
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -316,6 +317,16 @@ def run_pipeline(spec_dir: str):
             aa.export_insights(md_out, format="markdown")
             print(f"  Saved {len(insights)} insights to {md_out}")
         _log("analytics", f"Analytics Agent done -- {len(insights)} insight(s)", stage_t0)
+
+        # 4.5 Interactive Q&A -- only when run from a real terminal. Guarded on
+        # isatty() so pytest/CI (piped/redirected stdin) never blocks forever
+        # on input(); a human running `python main.py specs/...` directly gets
+        # prompted for their own analytics questions before the dashboard is built.
+        if sys.stdin.isatty():
+            with tracer.trace_span("pipeline.analytics.interactive"):
+                aa.run_interactive()
+            aa.export_insights(md_out, format="markdown")
+            print(f"  Re-saved {len(insights)} insight(s) (including interactive ones) to {md_out}")
 
         # 5. Build the dashboard
         stage_t0 = time.monotonic()

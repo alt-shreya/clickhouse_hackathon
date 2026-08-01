@@ -10,9 +10,12 @@ Analytics Agent
    runs. "random" / "i'm feeling lucky" skips the LLM and runs a predetermined
    query instead.
 3. Runs the query on ClickHouse and gets the aggregate result back.
-4. Interprets that result: pulls in business context, breaks it down across
-   device/geo/funnel-stage/segment cuts, and asks the LLM to turn all of that
-   into actionable insights (never the raw numbers alone).
+4. Interprets that result: pulls in business context (to explain WHY, never to
+   supply numbers) and asks the LLM to turn the query's own rows into actionable
+   insights -- strictly grounded in what that query actually returned, not
+   supplemented with other side-queries the user never saw (see
+   interpret_results()'s docstring for why that was a real trust problem, not
+   just noise).
 """
 
 from pathlib import Path
@@ -127,6 +130,49 @@ LUCKY_QUERIES: List[Dict[str, str]] = [
     },
 ]
 
+# Few-shot style anchor for nl_to_sql()'s system prompt: bucketed grouping with a
+# guarded-division percentage, and a multi-CTE trend with currency normalization --
+# both real, previously hand-written analyses, not toy examples. The point isn't
+# these exact queries; it's "aggregate down to a handful of meaningful rows" instead
+# of a flat multi-dimension dump.
+_GOOD_QUERY_EXAMPLES = """=== EXAMPLE 1: bucketed segment comparison (not a raw per-value breakdown) ===
+SELECT
+    CASE
+        WHEN lower(citizenship) IN ('in', 'pk') THEN 'Latin / Major Script (IN, PK)'
+        ELSE 'Non-Latin / Other Script (Other)'
+    END AS citizenship_group,
+    count() AS total_uploads,
+    sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS uploads_with_retries,
+    round(sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) * 100.0 / nullIf(count(), 0), 2) AS pct_with_retries,
+    round(avg(retry_count), 2) AS avg_retry_count,
+    sum(is_crossed_failed_attempt_threshold) AS threshold_failures
+FROM atlys.document_uploaded
+WHERE lower(doc_type) LIKE '%passport%'
+GROUP BY citizenship_group
+ORDER BY pct_with_retries DESC;
+
+=== EXAMPLE 2: monthly trend with currency normalization (CTEs, not a raw dump) ===
+WITH
+    currency_subtotals AS (
+        SELECT toStartOfMonth(timestamp) AS month_start, coalesce(currency, 'UNKNOWN') AS currency,
+               sum(coalesce(value, 0)) AS native_sum, count() AS conversion_count
+        FROM atlys.purchase_completed
+        WHERE timestamp >= now() - INTERVAL 12 MONTH
+        GROUP BY month_start, currency
+    ),
+    normalized_to_usd AS (
+        SELECT month_start,
+               sum(CASE currency WHEN 'USD' THEN native_sum WHEN 'INR' THEN native_sum * 0.012 ELSE native_sum END) AS total_revenue_usd,
+               sum(conversion_count) AS total_conversions
+        FROM currency_subtotals
+        GROUP BY month_start
+    )
+SELECT month_start, total_revenue_usd, total_conversions,
+       round(total_revenue_usd / nullIf(total_conversions, 0), 2) AS revenue_per_conversion
+FROM normalized_to_usd
+ORDER BY month_start ASC
+LIMIT 200;"""
+
 _LUCKY_TRIGGERS = ("random", "i'm feeling lucky", "im feeling lucky", "feeling lucky", "surprise me", "lucky")
 
 # Only read-only statements may be executed -- the SQL text in this file comes
@@ -144,6 +190,10 @@ class AnalyticsAgent:
 
     CORE_FUNNEL_STEPS = ["destination_card_clicked", "application_started", "document_uploaded", "purchase_completed"]
     SEGMENT_CUT_COLUMNS = ("device_type", "geoip_country_code", "funnel_type")
+    # Below the LIMIT 200 backstop but high enough that hitting it signals the
+    # request itself was too broad, not just a query that happens to have a lot
+    # of legitimate rows -- see handle_insight_request()'s "narrow it" hint.
+    _BROAD_RESULT_HINT_THRESHOLD = 150
 
     def __init__(self, client, database: str, context_agent=None, openrouter_config=None):
         self.client = client
@@ -297,24 +347,55 @@ class AnalyticsAgent:
             raise ValueError("Generated query contains a disallowed keyword -- only read-only SELECTs are permitted.")
 
     def _sql_system_prompt(self) -> str:
-        return """You are an expert ClickHouse SQL analyst.
+        return f"""You are an expert ClickHouse SQL analyst.
 You write SQL -- you never compute, guess, or state the answer yourself; ClickHouse
 executes the query and does 100% of the aggregation.
 
-Rules:
+CRITICAL -- result size discipline. Every row you return gets fed into another LLM
+call to interpret; an unnecessarily wide result burns tokens and money for zero
+analytical benefit, and dumping raw dimension cross-products isn't an insight anyway.
+- ALWAYS bound event tables by time. If the request doesn't name a range (e.g.
+  "trends", "recently", "lately", no dates mentioned), default to the LAST QUARTER:
+  `WHERE timestamp >= now() - INTERVAL 90 DAY`. Never scan a table's full history
+  unless the request explicitly asks for all-time or names a wider range.
+- Pick the grain and the 1-2 dimensions that actually answer the question, not every
+  dimension "just in case". A result of roughly 10-50 rows is usually the right size
+  for a question like this; if your query would return far more, aggregate further --
+  a coarser time grain (week/month instead of day), a CASE-bucketed grouping instead
+  of a raw high-cardinality breakdown (see Example 1), or one fewer GROUP BY column.
+- ALWAYS end with `LIMIT 200` as a hard backstop, even after aggregating well.
+- Round floats to 2 decimals; guard every division with nullIf(denominator, 0).
+
+Other rules:
 - Output ONE single ClickHouse SQL statement, starting with SELECT or WITH. Nothing else:
   no prose, no explanation, no markdown fences.
 - Read-only only: never INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/TRUNCATE/SET/SYSTEM.
 - Only reference tables/columns that appear in the provided schema.
-- For trends: group by toStartOfDay/toStartOfWeek/toStartOfMonth(timestamp).
+- For trends: group by toStartOfDay/toStartOfWeek/toStartOfMonth(timestamp) -- choose
+  the grain so row count stays reasonable across the window (weekly, not daily, for a
+  multi-month span).
 - For anomalies: compare a value against its trailing average/stddev (e.g. window
   functions with ROWS BETWEEN, or stddevPop over a grouped window).
 - For segment comparisons: GROUP BY the relevant segment column(s) (e.g. device_type,
-  geoip_country_code, os, funnel_type) and order by the primary metric.
+  geoip_country_code, os, funnel_type) and order by the primary metric, not the segment name.
 - For correlations: use corr() or covarPop() between two numeric measures.
 - For funnels/sequential behavior: prefer windowFunnel()/sequenceMatch() over
   independent per-table counts, per the provided analysis guidance.
-- Always qualify table names with the database (e.g. atlys.purchase_completed)."""
+- Always qualify table names with the database (e.g. atlys.purchase_completed).
+
+{_GOOD_QUERY_EXAMPLES}
+Match this style: CTEs when the logic has real stages, CASE-based bucketing over raw
+per-value breakdowns, guarded division, sensible rounding, ORDER BY the metric that
+matters (not the group label)."""
+
+    def _ensure_row_limit(self, sql: str, default_limit: int = 200) -> str:
+        """Deterministic backstop, independent of how well the prompt's row-budget
+        guidance gets followed: if the generated query has no LIMIT, add one. Every
+        row that comes back gets fed into another LLM call to interpret, so an
+        unbounded result is a direct token/cost hit, not just a style nit."""
+        if re.search(r"\bLIMIT\s+\d+", sql, re.IGNORECASE):
+            return sql
+        return f"{sql.rstrip()}\nLIMIT {default_limit}"
 
     def nl_to_sql(self, request: str, tables: Optional[List[str]] = None) -> str:
         """Turn a natural-language analytics request into a single read-only SQL
@@ -351,7 +432,7 @@ Return only the SQL statement."""
             raw = (response.choices[0].message.content or "").strip()
             sql = self._extract_sql(raw)
             self._validate_readonly_sql(sql)
-            return sql
+            return self._ensure_row_limit(sql)
 
     # ============================================================
     # 3. Run the query on ClickHouse (coordinate + fetch results)
@@ -373,6 +454,12 @@ Return only the SQL statement."""
             print(f"\nGenerated query:\n{sql}\n")
             rows = self.run_query(sql)
             print(f"ClickHouse returned {len(rows)} row(s).")
+            if len(rows) >= self._BROAD_RESULT_HINT_THRESHOLD:
+                print(
+                    "  Hint: that's a lot of rows for one question -- try narrowing it: name a "
+                    "specific segment ('by device_type'), a shorter time window, or a specific "
+                    "metric instead of everything at once. A vague request burns more tokens for a fuzzier answer."
+                )
 
             insights = self.interpret_results(request=label, sql=sql, rows=rows)
             for insight in insights:
@@ -399,50 +486,34 @@ Return only the SQL statement."""
         return self.insights
 
     # ============================================================
-    # 4. Interpret results: business context + multiple cuts -> insights
+    # 4. Interpret results: business context -> insights, strictly grounded
+    #    in what the query actually returned
     # ============================================================
 
-    def _tables_in_query(self, sql: str) -> List[str]:
-        pattern = re.compile(r"\b(?:FROM|JOIN)\s+(?:[`\"]?\w+[`\"]?\.)?[`\"]?(\w+)[`\"]?", re.IGNORECASE)
-        return sorted({m for m in pattern.findall(sql) if m.lower() != "system"})
-
-    def _multi_cut_breakdown(self, tables: List[str]) -> Dict[str, Any]:
-        """Device, geo, segment, and funnel-stage cuts for the tables a query
-        touched -- so insights aren't judged off a single aggregate number."""
-        cuts: Dict[str, Any] = {}
-        for table in tables:
-            for col in self.SEGMENT_CUT_COLUMNS:
-                try:
-                    rows = self.analyze_by_segment(col, table)
-                    if rows:
-                        cuts[f"{table}.{col}"] = rows
-                except Exception:
-                    pass
-
-        funnel_tables = [t for t in self.CORE_FUNNEL_STEPS if t in tables]
-        if len(funnel_tables) > 1:
-            try:
-                funnel = self.sequential_funnel(funnel_tables)
-                cuts["funnel_stage"] = funnel
-                cuts["funnel_drop_offs"] = self.get_drop_off_rates(funnel)
-            except Exception:
-                pass
-
-        return cuts
-
     def interpret_results(self, request: str, sql: str, rows: List[Dict]) -> List[Insight]:
-        """Apply business context and multi-cut breakdowns to a raw ClickHouse
-        result, and turn it into actionable insights via the LLM narrative engine."""
-        tables = self._tables_in_query(sql)
-        cuts = self._multi_cut_breakdown(tables)
-        context_text = self._context_text(tables or None)
+        """Apply business context to a raw ClickHouse result and turn it into
+        actionable insights via the LLM narrative engine.
+
+        Deliberately does NOT run extra "multi-cut" queries (device/geo/segment
+        breakdowns) behind the scenes anymore. A prior version did, and it was
+        a real trust problem, not just noise: analyze_by_segment() has no time
+        filter, so those side-queries pulled ALL-TIME totals into the same
+        prompt as e.g. a "last 90 days" trend query, with nothing telling the
+        LLM (or the user) they came from a different scope -- the LLM then
+        blended them into one narrative, producing numbers (e.g. "iOS: 63.5K
+        app starters") that don't trace back to the query actually shown on
+        screen. Insights are now grounded ONLY in `rows` -- the exact result
+        of the exact query the user saw. If a request needs a device/geo/
+        segment cut, that has to be in the query itself (the SQL system prompt
+        already asks for the right dimensions).
+        """
+        context_text = self._context_text()
 
         payload = {
             "request": request,
             "query": sql,
             "result_row_count": len(rows),
             "result_rows": rows[:200],  # cap so a large result set doesn't blow the prompt
-            "additional_cuts": cuts,
         }
 
         if not self._llm_client:
@@ -595,12 +666,28 @@ Return only the SQL statement."""
         Query Results:
         {json.dumps(query_results, indent=2, default=str)}
 
+        GROUNDING RULE -- every number in every insight must come from "Query Results"
+        above. Do not introduce a figure, percentage, or segment breakdown that isn't
+        literally present there, even if it's true in general or you recall it from
+        elsewhere in Context -- if "Query Results" doesn't have it, you don't state it.
+        Context may explain WHY a number in Query Results looks the way it does (e.g. a
+        known issue), but it is never itself the source of a number in an insight.
+
+        Style rules for "description" -- these are read on a dashboard, not in a report:
+        - ONE sentence, ~20 words max. Lead with the number, not the setup.
+        - State the action directly ("Fix the iOS OTP autofill bug" not "Consider
+          investigating whether the OTP issue may be contributing to this").
+        - Cut hedging and connective filler: no "This suggests", "It's worth noting",
+          "may potentially", "warrants investigation". Say what you mean.
+        - If a known issue from context explains it, name it in ~3 words, don't restate
+          the issue's full description.
+
         Output JSON format:
         {{
             "insights": [
                 {{
                     "title": "Short title",
-                    "description": "Detailed narrative insight, what it means, and suggested action.",
+                    "description": "One terse sentence: the number + the action.",
                     "metric": "name of key metric",
                     "value": "value of metric",
                     "severity": "info, warning, or critical",
@@ -617,7 +704,7 @@ Return only the SQL statement."""
                 response = self._llm_client.chat.completions.create(
                     model=self.openrouter_config.model,
                     messages=[
-                        {"role": "system", "content": "You are an expert product analyst."},
+                        {"role": "system", "content": "You are an expert product analyst who writes tight, scannable dashboard copy for busy PMs -- no filler, no hedging, straight to the point."},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,

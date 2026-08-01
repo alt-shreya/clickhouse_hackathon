@@ -207,13 +207,22 @@ class InstrumentationAgent:
         }
     
     def _load_registry(self):
-        """Load existing table metadata from meta_context_registry."""
+        """Load existing table metadata from meta_context_registry -- name,
+        kind, description, and version only.
+
+        Everything else this table stores per row (`columns` -- a full
+        Array(Tuple(name, type, description)) per table -- plus source_spec,
+        ordering_key, partition_key, ttl_expression, related_entities, tags,
+        is_current) is dead weight here: get_context_summary() only ever reads
+        kind/description, and validate_schema()'s collision check only ever
+        reads entity_name/version. A prior version pulled every column,
+        including the heaviest one (`columns`), for every registered table on
+        every process_spec() call regardless of whether anything used it --
+        the more tables get registered, the more wasted work and prompt bloat
+        that adds up to, for zero benefit.
+        """
         query = f"""
-        SELECT 
-            entity_name, entity_type, kind, description,
-            columns, source_spec, ordering_key, partition_key,
-            ttl_expression, related_entities, tags,
-            version, is_current
+        SELECT entity_name, kind, description, version
         FROM {self.database}.{self.registry_table}
         WHERE is_current = 1
         """
@@ -222,18 +231,9 @@ class InstrumentationAgent:
             entity_name = row[0]
             self._existing_tables[entity_name] = {
                 "entity_name": row[0],
-                "entity_type": row[1],
-                "kind": row[2],  # funnel, supporting
-                "description": row[3],
-                "columns": row[4],  # Array of column objects
-                "source_spec": row[5],
-                "ordering_key": row[6],
-                "partition_key": row[7],
-                "ttl_expression": row[8],
-                "related_entities": row[9],
-                "tags": row[10],
-                "version": row[11],
-                "is_current": row[12],
+                "kind": row[1],  # funnel, supporting
+                "description": row[2],
+                "version": row[3],
             }
     
     def get_existing_table(self, name: str) -> Optional[Dict[str, Any]]:
@@ -261,19 +261,20 @@ class InstrumentationAgent:
             parts.append(f"=== BUSINESS CONTEXT (living document, version {version}) ===")
             parts.append(content)
 
-        # Existing tables
+        # Existing tables -- name + one-line description only, straight from
+        # meta_context_registry (never raw table data). A prior version dumped
+        # every column of every registered table into this prompt on every
+        # call -- 37 tables and growing, tens of thousands of characters --
+        # which measurably slowed schema-generation LLM calls and was a
+        # repeat contributor to truncated/invalid JSON output. Column-level
+        # detail for anything already documented also lives (more concisely)
+        # in the business-context document's own "Auto-instrumented tables"
+        # section above; this is just an index so the LLM knows what already
+        # exists and doesn't reinvent a table under a new name.
         if self._existing_tables:
-            parts.append("\n=== EXISTING TABLES (from meta_context_registry) ===")
+            parts.append(f"\n=== EXISTING TABLES ({len(self._existing_tables)}, from meta_context_registry) ===")
             for name, t in self._existing_tables.items():
-                parts.append(f"\nTable: {name} ({t['kind']})")
-                parts.append(f"  Description: {t['description']}")
-                parts.append(f"  Ordering: {t['ordering_key']}")
-                parts.append(f"  Partition: {t['partition_key']}")
-                parts.append(f"  Related: {', '.join(t['related_entities'])}")
-                parts.append(f"  Tags: {', '.join(t['tags'])}")
-                parts.append("  Columns:")
-                for col in t["columns"]:
-                    parts.append(f"    - {col['name']}: {col['type']} — {col.get('description', '')}")
+                parts.append(f"  - {name} ({t['kind']}): {t['description']}")
 
         return "\n".join(parts)
     
@@ -340,7 +341,7 @@ class InstrumentationAgent:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=4000,
+                max_tokens=8000,
                 response_format={"type": "json_object"},
             )
             
@@ -377,8 +378,19 @@ class InstrumentationAgent:
             return self._basic_parse(spec_md, events_sample)
     
     def _get_system_prompt(self) -> str:
-        return """You are an expert ClickHouse schema designer for Atlys, a digital visa platform.
+        # Deliberately does NOT ask for columns[]/partition_by/order_by/related_tables[]
+        # on suggested_tables: nothing downstream reads them -- generate_schema()'s own
+        # LLM call designs the real schema from scratch afterward, and the basic-fallback
+        # path (_basic_generate/_build_basic_columns/_pick_order_by) computes its own
+        # columns and ordering rather than trusting this step's. Asking for full table
+        # designs here was pure wasted output -- on a spec with many suggested tables it
+        # measurably inflated the response (multi-hundred-line JSON) for zero downstream
+        # benefit, which is also just more surface area for a smaller model to make a
+        # syntax slip in and trip json.loads().
+        return """You are an expert product analyst for Atlys, a digital visa platform.
 Analyze feature specifications and extract structured information for schema generation.
+This step only extracts and summarizes -- proper ClickHouse types, partitioning, and
+ordering keys are all decided in a separate step, so do not design full table schemas here.
 
 Return JSON with:
 - feature_name: short kebab-case name
@@ -387,14 +399,7 @@ Return JSON with:
 - events: list of {name, description, trigger, entity_refs[], properties[]}
 - properties: dict of property_name -> {type, description, examples[]}
 - relationships: list of {from, to, type, description}
-- suggested_tables: list of {name, kind (funnel/supporting/dimension), description, columns[], partition_by, order_by, related_tables[]}
-
-Focus on:
-- Reusing existing patterns from Atlys (user_id, application_id, timestamp envelope)
-- Proper ClickHouse types (LowCardinality for enums, Nullable appropriately)
-- Monthly partitioning by timestamp
-- Ordering by (id, timestamp, user_id) for event tables
-- Distinguishing funnel vs supporting tables"""
+- suggested_tables: list of {name, kind (funnel/supporting/dimension), description} -- name/kind/description ONLY"""
 
     def _build_analysis_prompt(self, spec_md: str, events_sample: List[Dict]) -> str:
         context = self.get_context_summary()
@@ -410,7 +415,8 @@ Focus on:
 === EVENTS SAMPLE (stratified, up to 5 per event type) ===
 {events_json}
 
-Extract all entities, events, properties, and relationships. Suggest new table designs that follow Atlys patterns."""
+Extract all entities, events, properties, and relationships. Suggest new table names (with kind
+and a one-line description) that follow Atlys patterns -- don't design their columns/schema yet."""
 
     def _basic_parse(self, spec_md: str, events_sample: List[Dict]) -> SpecAnalysis:
         """Basic regex-based parsing as fallback."""
@@ -509,7 +515,7 @@ Extract all entities, events, properties, and relationships. Suggest new table d
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.1,
-                    max_tokens=6000,
+                    max_tokens=10000,
                     response_format={"type": "json_object"},
                 )
                 
