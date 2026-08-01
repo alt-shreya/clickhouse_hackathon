@@ -96,6 +96,138 @@ class OpenRouterConfig:
             raise ImportError("openai package required: pip install openai")
 
 
+# ---------------------------------------------------------------------------
+# Anthropic -- a direct, non-OpenRouter LLM provider. Every call site in this
+# codebase (InstrumentationAgent, AnalyticsAgent, ContextAgent's llm_call_fn)
+# was written against an OpenAI-shaped client: `client.chat.completions.create(
+# model=..., messages=[...], temperature=..., max_tokens=..., response_format=...)`
+# returning `.choices[0].message.content`. Rather than touch every call site,
+# AnthropicConfig.get_client() returns an adapter that exposes that exact same
+# surface but calls the real Anthropic Messages API underneath -- so it's a
+# drop-in replacement for OpenRouterConfig anywhere one is threaded through.
+# ---------------------------------------------------------------------------
+
+class _AnthropicMessage:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _AnthropicChoice:
+    def __init__(self, content: str):
+        self.message = _AnthropicMessage(content)
+
+
+class _AnthropicResponse:
+    def __init__(self, content: str):
+        self.choices = [_AnthropicChoice(content)]
+
+
+class _AnthropicChatCompletions:
+    def __init__(self, anthropic_client):
+        self._client = anthropic_client
+
+    def create(self, model, messages, temperature: float = 0.1, max_tokens: int = 2000,
+               response_format: Optional[dict] = None, **_ignored):
+        """Translates one OpenAI-shaped chat.completions.create() call into an
+        Anthropic messages.create() call and wraps the reply back into an
+        OpenAI-shaped response object."""
+        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+        user_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages if m.get("role") != "system"
+        ]
+        system = "\n\n".join(system_parts) if system_parts else None
+
+        if response_format and response_format.get("type") == "json_object":
+            # Claude has no forced-JSON response mode like OpenAI's
+            # response_format param -- every call site's own prompt text
+            # already asks for JSON-only output, so just reinforce it.
+            json_instruction = "\n\nRespond with ONLY valid JSON. No markdown fences, no prose, no explanation."
+            system = (system or "") + json_instruction
+
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": user_messages,
+        }
+        if system:
+            payload["system"] = system
+
+        # `temperature` and `thinking` are best-effort extras, stripped on a
+        # per-param 400 and retried:
+        # - `temperature`: current Claude models (e.g. claude-sonnet-5) reject
+        #   it outright ("`temperature` is deprecated for this model", HTTP 400)
+        #   rather than ignoring it.
+        # - `thinking: disabled`: extended thinking defaults ON for some Claude
+        #   models and eats into max_tokens as hidden reasoning tokens --
+        #   observed live: a 2000-token budget spent 1602 tokens thinking,
+        #   leaving too little for the actual JSON this call wants (truncated/
+        #   empty output). None of this codebase's call sites want visible
+        #   reasoning, so disable it; older models that don't recognize the
+        #   param fall back the same way.
+        extra = {"temperature": temperature, "thinking": {"type": "disabled"}}
+        while True:
+            try:
+                response = self._client.messages.create(**payload, **extra)
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                stripped = [k for k in list(extra) if k.lower() in msg]
+                if not stripped:
+                    raise
+                for k in stripped:
+                    del extra[k]
+        text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+        return _AnthropicResponse(text)
+
+
+class _AnthropicChat:
+    def __init__(self, anthropic_client):
+        self.completions = _AnthropicChatCompletions(anthropic_client)
+
+
+class _AnthropicOpenAICompatClient:
+    """Duck-types an OpenAI client -- exposes `.chat.completions.create(...)` --
+    backed by the real `anthropic` SDK."""
+    def __init__(self, anthropic_client):
+        self.chat = _AnthropicChat(anthropic_client)
+
+
+@dataclass
+class AnthropicConfig:
+    """Direct Anthropic API configuration. Exposes the same (enabled, model,
+    get_client()) shape as OpenRouterConfig, so it can be passed anywhere an
+    *_config object is threaded through (InstrumentationAgent, AnalyticsAgent,
+    make_llm_call_fn) without changing those call sites."""
+    api_key: str = ""
+    # Haiku 4.5, not one of the Claude 5 reasoning models -- every call site
+    # here is a bounded structured-output task (schema JSON, SQL text, insight
+    # JSON), not open-ended reasoning, so the cheaper/faster/lower-token model
+    # is the better default. Override with ANTHROPIC_MODEL.
+    model: str = "claude-haiku-4-5-20251001"
+    enabled: bool = True
+
+    @classmethod
+    def from_env(cls) -> "AnthropicConfig":
+        """Load config from environment variables."""
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        return cls(
+            api_key=api_key,
+            model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            enabled=bool(api_key),
+        )
+
+    def get_client(self):
+        """Get an OpenAI-compatible client backed by the Anthropic API."""
+        if not self.enabled:
+            raise ValueError("Anthropic not configured (missing API key)")
+        try:
+            import anthropic
+            return _AnthropicOpenAICompatClient(anthropic.Anthropic(api_key=self.api_key))
+        except ImportError:
+            raise ImportError("anthropic package required: pip install anthropic")
+
+
 def make_llm_call_fn(openrouter_config: "OpenRouterConfig"):
     """
     Build a (prompt, span_name) -> str callable backed by OpenRouter, matching the
@@ -171,13 +303,32 @@ def load_dotenv(env_path: Optional[Path] = None) -> bool:
         return True
 
 
-def get_config() -> tuple[ClickHouseConfig, LangfuseConfig, OpenRouterConfig]:
-    """Load all configs from environment."""
+def get_config() -> tuple[ClickHouseConfig, LangfuseConfig, "OpenRouterConfig | AnthropicConfig"]:
+    """Load all configs from environment.
+
+    The third element used to always be OpenRouterConfig -- now it's whichever
+    LLM provider is actually configured, preferring Anthropic (ANTHROPIC_API_KEY)
+    over OpenRouter (OPENROUTER_API_KEY) when both are set, since OpenRouter's
+    shared free-tier model rate-limits/returns empty responses under load (seen
+    live: schema-generation and context-audit calls failing with "Expecting
+    value: line 1 column 1"). Every caller (InstrumentationAgent, AnalyticsAgent,
+    make_llm_call_fn) only relies on the duck-typed (.enabled, .model,
+    .get_client()) shape both classes share, so nothing downstream needs to
+    change based on which provider this resolves to.
+    """
     # Try to load .env
     load_dotenv()
-    
+
     ch_config = ClickHouseConfig.from_env()
     lf_config = LangfuseConfig.from_env()
+
+    # --- Original behavior: OpenRouter only. Kept, not deleted. ---
+    # or_config = OpenRouterConfig.from_env()
+    # return ch_config, lf_config, or_config
+
+    # --- Current behavior: prefer Anthropic when configured. ---
+    anthropic_config = AnthropicConfig.from_env()
     or_config = OpenRouterConfig.from_env()
-    
-    return ch_config, lf_config, or_config
+    llm_config = anthropic_config if anthropic_config.enabled else or_config
+
+    return ch_config, lf_config, llm_config

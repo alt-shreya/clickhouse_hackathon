@@ -1,7 +1,10 @@
-# All three agents (Context/Instrumentation/Analytics) share one LLM provider:
-# OpenRouter, via the `openai` package below (OpenAI-compatible endpoint). See
-# agents/config.py:make_llm_call_fn(). The `anthropic` package is not used --
-# ANTHROPIC_API_KEY in .env is currently inert; set OPENROUTER_API_KEY instead.
+# All three agents (Context/Instrumentation/Analytics) share one LLM provider,
+# resolved by agents/config.py:get_config(). Anthropic is preferred when
+# ANTHROPIC_API_KEY is set (agents/config.py:AnthropicConfig, adapted to the
+# same OpenAI-shaped .chat.completions.create() interface every agent call
+# site uses); OpenRouter (OPENROUTER_API_KEY, via the `openai` package below)
+# is the fallback -- kept for when Anthropic isn't configured, or its shared
+# free-tier model is preferred for cost reasons despite being less reliable.
 
 # Langfuse -- required by the problem statement for tracing every LLM call and SQL span
 langfuse>=2.53.0
@@ -13,8 +16,11 @@ langfuse>=2.53.0
 # Core
 clickhouse-connect>=1.6.0
 
-# LLM (OpenRouter - OpenAI compatible)
+# LLM (OpenRouter - OpenAI compatible; fallback provider)
 openai>=1.0.0
+
+# LLM (Anthropic direct; preferred provider when ANTHROPIC_API_KEY is set)
+anthropic>=0.40.0
 
 # Data processing
 pandas>=2.0.0

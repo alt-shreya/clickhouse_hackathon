@@ -1,12 +1,26 @@
 """
 Analytics Agent
-Queries data, applies context, writes insight summaries.
+
+1. Reads straight from the ContextAgent's own tables (agent_control.context_layer,
+   atlys.meta_context_registry) to see what the Instrumentation/Context agents just
+   did -- newly registered tables, new business rules, open flags -- rather than
+   only trusting whatever a caller happens to pass in.
+2. Turns a natural-language analytics request into ClickHouse SQL. The LLM's ONLY
+   job is to write the query text; ClickHouse does all the aggregation once it
+   runs. "random" / "i'm feeling lucky" skips the LLM and runs a predetermined
+   query instead.
+3. Runs the query on ClickHouse and gets the aggregate result back.
+4. Interprets that result: pulls in business context, breaks it down across
+   device/geo/funnel-stage/segment cuts, and asks the LLM to turn all of that
+   into actionable insights (never the raw numbers alone).
 """
 
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
 import json
+import random
+import re
 
 from agents.tracing.agent import get_tracer
 
@@ -25,10 +39,111 @@ class Insight:
     timestamp: str = ""
 
 
+# ---------------------------------------------------------------------------
+# "I'm feeling lucky" -- predetermined queries run when the user doesn't have a
+# specific question. Each targets the 8 core production tables (base_context.md
+# §3), so they run regardless of which spec's tables happen to be loaded.
+# Column names follow base_context.md §3/§4 exactly (e.g. `value`/`currency` on
+# purchase_completed, `is_crossed_failed_attempt_threshold` on document_uploaded).
+# ---------------------------------------------------------------------------
+LUCKY_QUERIES: List[Dict[str, str]] = [
+    {
+        "label": "Weekly conversion trend",
+        "description": "Purchases and unique buyers by week, last 90 days.",
+        "sql": """
+            SELECT toStartOfWeek(timestamp) AS week,
+                   count() AS purchases,
+                   uniq(user_id) AS buyers
+            FROM {database}.purchase_completed
+            WHERE timestamp >= now() - INTERVAL 90 DAY
+            GROUP BY week
+            ORDER BY week
+        """,
+    },
+    {
+        "label": "Device split of the core funnel",
+        "description": "Users reaching each core funnel step, split by device_type.",
+        "sql": """
+            SELECT device_type,
+                   uniqIf(user_id, step = 'destination_card_clicked') AS clicked,
+                   uniqIf(user_id, step = 'application_started') AS started,
+                   uniqIf(user_id, step = 'purchase_completed') AS purchased
+            FROM (
+                SELECT user_id, device_type, 'destination_card_clicked' AS step FROM {database}.destination_card_clicked
+                UNION ALL
+                SELECT user_id, device_type, 'application_started' FROM {database}.application_started
+                UNION ALL
+                SELECT user_id, device_type, 'purchase_completed' FROM {database}.purchase_completed
+            )
+            GROUP BY device_type
+            ORDER BY purchased DESC
+        """,
+    },
+    {
+        "label": "Top countries by purchase volume",
+        "description": "geoip_country_code ranked by purchases and revenue, last 30 days.",
+        "sql": """
+            SELECT geoip_country_code,
+                   count() AS purchases,
+                   sum(value) AS revenue
+            FROM {database}.purchase_completed
+            WHERE timestamp >= now() - INTERVAL 30 DAY
+            GROUP BY geoip_country_code
+            ORDER BY revenue DESC
+            LIMIT 20
+        """,
+    },
+    {
+        "label": "Daily anomalies in application starts",
+        "description": "Days where application_started volume deviates from its trailing 7-day average.",
+        "sql": """
+            WITH daily AS (
+                SELECT toDate(timestamp) AS day, count() AS starts
+                FROM {database}.application_started
+                WHERE timestamp >= now() - INTERVAL 60 DAY
+                GROUP BY day
+            )
+            SELECT day, starts,
+                   avg(starts) OVER (ORDER BY day ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS trailing_avg,
+                   stddevPop(starts) OVER (ORDER BY day ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING) AS trailing_std
+            FROM daily
+            ORDER BY day DESC
+            LIMIT 30
+        """,
+    },
+    {
+        "label": "Document capture pass rate by OS",
+        "description": "document_uploaded pass rate (is_crossed_failed_attempt_threshold = 0), split by os.",
+        "sql": """
+            SELECT os,
+                   countIf(is_crossed_failed_attempt_threshold = 0) AS passes,
+                   count() AS attempts,
+                   passes / attempts AS pass_rate
+            FROM {database}.document_uploaded
+            WHERE os IS NOT NULL
+            GROUP BY os
+            ORDER BY attempts DESC
+        """,
+    },
+]
+
+_LUCKY_TRIGGERS = ("random", "i'm feeling lucky", "im feeling lucky", "feeling lucky", "surprise me", "lucky")
+
+# Only read-only statements may be executed -- the SQL text in this file comes
+# straight from an LLM. Blocks anything that mutates data/schema; a stray
+# semicolon (a second statement smuggled in) is rejected separately.
+_FORBIDDEN_SQL_KEYWORDS = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|ATTACH|DETACH|RENAME|"
+    r"GRANT|REVOKE|KILL|OPTIMIZE|SYSTEM|EXCHANGE|SET)\b",
+    re.IGNORECASE,
+)
+
+
 class AnalyticsAgent:
     """Agent that analyzes data and produces actionable insights."""
 
     CORE_FUNNEL_STEPS = ["destination_card_clicked", "application_started", "document_uploaded", "purchase_completed"]
+    SEGMENT_CUT_COLUMNS = ("device_type", "geoip_country_code", "funnel_type")
 
     def __init__(self, client, database: str, context_agent=None, openrouter_config=None):
         self.client = client
@@ -42,10 +157,325 @@ class AnalyticsAgent:
             self._llm_client = openrouter_config.get_client()
 
     def run_query(self, query: str) -> List[Dict]:
-        """Execute a query and return results as list of dicts."""
+        """Execute a query and return results as list of dicts. This is the one
+        place any agent code -- deterministic or LLM-generated -- actually talks
+        to ClickHouse."""
         result = self.client.query(query)
         columns = result.column_names
         return [dict(zip(columns, row)) for row in result.result_rows]
+
+    # ============================================================
+    # 1. What changed -- read straight from the ContextAgent's tables
+    # ============================================================
+
+    def discover_context_changes(self) -> Dict[str, Any]:
+        """Everything the ContextAgent/InstrumentationAgent currently know:
+        every table registered in atlys.meta_context_registry (newest first),
+        plus the unified Tier 1/Tier 2/flags view from ContextAgent.get_latest_context().
+        This is how the Analytics Agent finds out what just got instrumented
+        without needing it handed to it as an argument."""
+        context = self.context_agent.get_latest_context() if self.context_agent else {}
+        return {
+            "newly_instrumented_tables": self._registered_tables(),
+            "business_context": context.get("business_context", []),
+            "schema_context": context.get("schema_context", {}),
+            "open_flags": context.get("flags", []),
+            "context_version": context.get("context_version", 0),
+        }
+
+    def _registered_tables(self) -> List[Dict[str, Any]]:
+        """Every currently-registered table in meta_context_registry, newest first."""
+        query = f"""
+            SELECT entity_name, kind, description, source_spec, version, created_at
+            FROM {self.database}.meta_context_registry
+            WHERE is_current = 1
+            ORDER BY created_at DESC
+        """
+        try:
+            return self.run_query(query)
+        except Exception as e:
+            print(f"Could not read meta_context_registry: {e}")
+            return []
+
+    def list_available_tables(self) -> List[str]:
+        """All queryable tables in the database (core funnel + anything newly
+        instrumented), for scoping SQL generation and schema summaries."""
+        try:
+            rows = self.run_query(
+                f"SELECT name FROM system.tables WHERE database = '{self.database}' AND engine NOT LIKE '%View%'"
+            )
+            return sorted({r["name"] for r in rows} | set(self.CORE_FUNNEL_STEPS))
+        except Exception:
+            return list(self.CORE_FUNNEL_STEPS)
+
+    def _print_context_changes(self, changes: Dict[str, Any]) -> None:
+        tables = changes.get("newly_instrumented_tables", [])
+        print(f"\nContext check: {len(tables)} table(s) currently registered in meta_context_registry.")
+        for t in tables[:5]:
+            print(f"  - {t.get('entity_name', '?')} (source: {t.get('source_spec') or 'n/a'})")
+        if len(tables) > 5:
+            print(f"  ...and {len(tables) - 5} more")
+        flags = changes.get("open_flags", [])
+        if flags:
+            print(f"  {len(flags)} open context flag(s) -- treat related numbers with suspicion.")
+
+    # ============================================================
+    # 2. Natural language -> SQL (LLM writes ONLY the query)
+    # ============================================================
+
+    def ask_user_for_request(self, prompt_fn: Callable[[str], str] = input) -> str:
+        return prompt_fn(
+            "\nWhat insight would you like? Describe it in plain English -- trends, "
+            "anomalies, segment comparisons, correlations -- or type 'random' / "
+            "\"i'm feeling lucky\" for a surprise query. ('quit' to stop)\n> "
+        ).strip()
+
+    def _is_lucky(self, request: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9' ]", "", request.strip().lower())
+        return any(trigger in normalized for trigger in _LUCKY_TRIGGERS)
+
+    def _schema_summary(self, tables: Optional[List[str]] = None) -> str:
+        """Real column names/types/comments from system.columns, so the SQL-writing
+        LLM works off the actual schema instead of guessing."""
+        where = f"database = '{self.database}'"
+        if tables:
+            in_list = ",".join(f"'{t}'" for t in tables)
+            where += f" AND table IN ({in_list})"
+        try:
+            rows = self.run_query(f"""
+                SELECT table, name, type, comment
+                FROM system.columns
+                WHERE {where}
+                ORDER BY table, position
+            """)
+        except Exception as e:
+            return f"(schema lookup failed: {e})"
+
+        by_table: Dict[str, List[Dict]] = {}
+        for r in rows:
+            by_table.setdefault(r["table"], []).append(r)
+
+        lines = []
+        for table, cols in by_table.items():
+            lines.append(f"Table {self.database}.{table}:")
+            for c in cols:
+                desc = f"  -- {c['comment']}" if c.get("comment") else ""
+                lines.append(f"  {c['name']} {c['type']}{desc}")
+        return "\n".join(lines) if lines else "(no schema info available)"
+
+    def _context_text(self, tables: Optional[List[str]] = None) -> str:
+        """Business context + schema comments + open flags, formatted for an LLM prompt."""
+        if not self.context_agent:
+            return "No context agent configured."
+        ctx = self.context_agent.get_latest_context(entities=tables or None)
+        parts = []
+
+        business = ctx.get("business_context", [])
+        if business:
+            parts.append("Business context (metrics, known issues, join map, analysis guidance):")
+            for row in business:
+                parts.append(f"  - [{row.get('value_type', '')}] {row.get('entity', '')}.{row.get('key', '')}: {row.get('value', '')}")
+
+        schema = ctx.get("schema_context", {})
+        if schema.get("tables") or schema.get("columns"):
+            parts.append("Schema comments:")
+            for t in schema.get("tables", []):
+                parts.append(f"  - Table {t.get('entity', '')}: {t.get('comment', '')}")
+            for c in schema.get("columns", []):
+                parts.append(f"  - {c.get('entity', '')}.{c.get('column', '')}: {c.get('comment', '')}")
+
+        flags = ctx.get("flags", [])
+        if flags:
+            parts.append("Open flags -- treat related numbers with suspicion:")
+            for f in flags:
+                parts.append(f"  - [{f.get('flag_type', '')}] {f.get('entity', '')}.{f.get('key', '')}: {f.get('description', '')}")
+
+        return "\n".join(parts) if parts else "No context rows found."
+
+    def _extract_sql(self, raw: str) -> str:
+        text = raw.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(sql)?\s*", "", text)
+            text = re.sub(r"```\s*$", "", text)
+        return text.strip().rstrip(";").strip()
+
+    def _validate_readonly_sql(self, sql: str) -> None:
+        if not sql:
+            raise ValueError("LLM returned an empty query.")
+        if ";" in sql:
+            raise ValueError("Only a single statement is allowed (found a ';' inside the query).")
+        if not re.match(r"^(SELECT|WITH)\b", sql.strip(), re.IGNORECASE):
+            raise ValueError("Generated query must be a read-only SELECT/WITH statement.")
+        if _FORBIDDEN_SQL_KEYWORDS.search(sql):
+            raise ValueError("Generated query contains a disallowed keyword -- only read-only SELECTs are permitted.")
+
+    def _sql_system_prompt(self) -> str:
+        return """You are an expert ClickHouse SQL analyst.
+You write SQL -- you never compute, guess, or state the answer yourself; ClickHouse
+executes the query and does 100% of the aggregation.
+
+Rules:
+- Output ONE single ClickHouse SQL statement, starting with SELECT or WITH. Nothing else:
+  no prose, no explanation, no markdown fences.
+- Read-only only: never INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/TRUNCATE/SET/SYSTEM.
+- Only reference tables/columns that appear in the provided schema.
+- For trends: group by toStartOfDay/toStartOfWeek/toStartOfMonth(timestamp).
+- For anomalies: compare a value against its trailing average/stddev (e.g. window
+  functions with ROWS BETWEEN, or stddevPop over a grouped window).
+- For segment comparisons: GROUP BY the relevant segment column(s) (e.g. device_type,
+  geoip_country_code, os, funnel_type) and order by the primary metric.
+- For correlations: use corr() or covarPop() between two numeric measures.
+- For funnels/sequential behavior: prefer windowFunnel()/sequenceMatch() over
+  independent per-table counts, per the provided analysis guidance.
+- Always qualify table names with the database (e.g. atlys.purchase_completed)."""
+
+    def nl_to_sql(self, request: str, tables: Optional[List[str]] = None) -> str:
+        """Turn a natural-language analytics request into a single read-only SQL
+        query. The LLM's only output is SQL text -- no aggregation happens in the
+        LLM, all of it happens once the query runs on ClickHouse."""
+        if not self._llm_client:
+            raise RuntimeError("No LLM configured (OPENROUTER_API_KEY) -- cannot translate the request to SQL.")
+
+        tables = tables or self.list_available_tables()
+        schema_summary = self._schema_summary(tables)
+        context_text = self._context_text(tables)
+
+        prompt = f"""Write a ClickHouse SQL query that answers this request:
+"{request}"
+
+=== SCHEMA ({self.database}) ===
+{schema_summary}
+
+=== BUSINESS CONTEXT ===
+{context_text}
+
+Return only the SQL statement."""
+
+        with get_tracer().trace_span("analytics.nl_to_sql", input_data={"request": request}):
+            response = self._llm_client.chat.completions.create(
+                model=self.openrouter_config.model,
+                messages=[
+                    {"role": "system", "content": self._sql_system_prompt()},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            sql = self._extract_sql(raw)
+            self._validate_readonly_sql(sql)
+            return sql
+
+    # ============================================================
+    # 3. Run the query on ClickHouse (coordinate + fetch results)
+    # ============================================================
+
+    def handle_insight_request(self, request: str) -> List[Insight]:
+        """End to end for a single user request: get SQL (LLM-written, or a
+        predetermined 'lucky' query), run it on ClickHouse, interpret the result."""
+        with get_tracer().trace_span("analytics.handle_insight_request", input_data={"request": request}):
+            if self._is_lucky(request):
+                lucky = random.choice(LUCKY_QUERIES)
+                label = f"(feeling lucky) {lucky['label']}"
+                sql = lucky["sql"].strip().format(database=self.database)
+                print(f"Feeling lucky -- running: {lucky['label']} -- {lucky['description']}")
+            else:
+                label = request
+                sql = self.nl_to_sql(request)
+
+            print(f"\nGenerated query:\n{sql}\n")
+            rows = self.run_query(sql)
+            print(f"ClickHouse returned {len(rows)} row(s).")
+
+            insights = self.interpret_results(request=label, sql=sql, rows=rows)
+            for insight in insights:
+                print(f"\n[{insight.severity.upper()}] {insight.title}\n{insight.description}")
+            return insights
+
+    def run_interactive(self, prompt_fn: Callable[[str], str] = input, max_rounds: Optional[int] = None) -> List[Insight]:
+        """Interactive loop: show what the ContextAgent has recorded, then
+        repeatedly ask the user what they want to know, turn it into SQL, run it,
+        and interpret the result -- until they quit."""
+        self._print_context_changes(self.discover_context_changes())
+
+        rounds = 0
+        while max_rounds is None or rounds < max_rounds:
+            request = self.ask_user_for_request(prompt_fn)
+            if not request or request.lower() in {"quit", "exit", "q", "done"}:
+                break
+            try:
+                self.handle_insight_request(request)
+            except Exception as e:
+                print(f"Could not complete that request: {e}")
+            rounds += 1
+
+        return self.insights
+
+    # ============================================================
+    # 4. Interpret results: business context + multiple cuts -> insights
+    # ============================================================
+
+    def _tables_in_query(self, sql: str) -> List[str]:
+        pattern = re.compile(r"\b(?:FROM|JOIN)\s+(?:[`\"]?\w+[`\"]?\.)?[`\"]?(\w+)[`\"]?", re.IGNORECASE)
+        return sorted({m for m in pattern.findall(sql) if m.lower() != "system"})
+
+    def _multi_cut_breakdown(self, tables: List[str]) -> Dict[str, Any]:
+        """Device, geo, segment, and funnel-stage cuts for the tables a query
+        touched -- so insights aren't judged off a single aggregate number."""
+        cuts: Dict[str, Any] = {}
+        for table in tables:
+            for col in self.SEGMENT_CUT_COLUMNS:
+                try:
+                    rows = self.analyze_by_segment(col, table)
+                    if rows:
+                        cuts[f"{table}.{col}"] = rows
+                except Exception:
+                    pass
+
+        funnel_tables = [t for t in self.CORE_FUNNEL_STEPS if t in tables]
+        if len(funnel_tables) > 1:
+            try:
+                funnel = self.sequential_funnel(funnel_tables)
+                cuts["funnel_stage"] = funnel
+                cuts["funnel_drop_offs"] = self.get_drop_off_rates(funnel)
+            except Exception:
+                pass
+
+        return cuts
+
+    def interpret_results(self, request: str, sql: str, rows: List[Dict]) -> List[Insight]:
+        """Apply business context and multi-cut breakdowns to a raw ClickHouse
+        result, and turn it into actionable insights via the LLM narrative engine."""
+        tables = self._tables_in_query(sql)
+        cuts = self._multi_cut_breakdown(tables)
+        context_text = self._context_text(tables or None)
+
+        payload = {
+            "request": request,
+            "query": sql,
+            "result_row_count": len(rows),
+            "result_rows": rows[:200],  # cap so a large result set doesn't blow the prompt
+            "additional_cuts": cuts,
+        }
+
+        if not self._llm_client:
+            # No LLM configured -- still surface the raw result as an insight
+            # rather than silently producing nothing.
+            return [self.generate_insight(
+                title=request[:80],
+                description=f"{len(rows)} row(s) returned. LLM not configured, so no narrative interpretation was generated.",
+                metric="row_count",
+                value=len(rows),
+                severity="info",
+                tags=["ad_hoc"],
+                query=sql,
+            )]
+
+        return self.generate_narrative_insights(payload, context_text, pm_questions=[request])
+
+    # ============================================================
+    # Deterministic analysis helpers (funnel, segments, anomalies)
+    # ============================================================
 
     def sequential_funnel(self, steps: List[str], id_column: str = "user_id", window_days: int = 30) -> Dict[str, int]:
         """Count users reaching each step of `steps`, IN ORDER, within a
@@ -91,11 +521,11 @@ class AnalyticsAgent:
             if current > 0:
                 rates[f"{steps[i]} -> {steps[i+1]}"] = (current - next_step) / current * 100
         return rates
-    
+
     def analyze_by_segment(self, segment_column: str, table: str) -> List[Dict]:
         """Analyze metrics broken down by a segment."""
         query = f"""
-        SELECT 
+        SELECT
             {segment_column},
             count(DISTINCT user_id) as users,
             count() as events
@@ -106,14 +536,14 @@ class AnalyticsAgent:
         LIMIT 20
         """
         return self.run_query(query)
-    
-    def detect_anomalies(self, table: str, metric_column: str, 
-                         time_column: str = "timestamp", 
+
+    def detect_anomalies(self, table: str, metric_column: str,
+                         time_column: str = "timestamp",
                          window: str = "1 day") -> List[Dict]:
         """Detect statistical anomalies in time series data."""
         query = f"""
         WITH stats AS (
-            SELECT 
+            SELECT
                 toStartOfDay({time_column}) as day,
                 avg({metric_column}) as avg_val,
                 stddevPop({metric_column}) as std_val
@@ -121,7 +551,7 @@ class AnalyticsAgent:
             WHERE {time_column} >= now() - INTERVAL 30 DAY
             GROUP BY day
         )
-        SELECT 
+        SELECT
             day,
             avg_val,
             std_val,
@@ -136,8 +566,8 @@ class AnalyticsAgent:
         LIMIT 30
         """
         return self.run_query(query)
-    
-    def generate_insight(self, title: str, description: str, metric: str, 
+
+    def generate_insight(self, title: str, description: str, metric: str,
                          value: Any, severity: str = "info", **kwargs) -> Insight:
         """Create and store an insight."""
         insight = Insight(
@@ -150,7 +580,7 @@ class AnalyticsAgent:
         )
         self.insights.append(insight)
         return insight
-    
+
     def generate_narrative_insights(
         self, query_results: Dict[str, Any], context: str, pm_questions: Optional[List[str]] = None
     ) -> List[Insight]:
@@ -191,10 +621,10 @@ class AnalyticsAgent:
                 }}
             ]
         }}
-        
+
         CRITICAL: Return ONLY valid JSON. Do not include markdown blocks, explanations, or any other text.
         """
-        
+
         with get_tracer().trace_span("analytics.generate_narrative_insights"):
             try:
                 response = self._llm_client.chat.completions.create(
@@ -204,10 +634,10 @@ class AnalyticsAgent:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.3,
-                    max_tokens=2000,
+                    max_tokens=4000,
                     response_format={"type": "json_object"},
                 )
-                
+
                 content = response.choices[0].message.content.strip()
                 # Strip markdown formatting if present
                 if content.startswith("```json"):
@@ -217,9 +647,9 @@ class AnalyticsAgent:
                 if content.endswith("```"):
                     content = content[:-3]
                 content = content.strip()
-                
+
                 parsed = json.loads(content)
-                
+
                 new_insights = []
                 for item in parsed.get("insights", []):
                     insight = self.generate_insight(
@@ -282,6 +712,10 @@ class AnalyticsAgent:
         answered that spec's own PM questions.
         """
         with get_tracer().trace_span("analytics.run_full_analysis", metadata={"spec_name": spec_name}):
+            # What the ContextAgent/InstrumentationAgent have on record right now
+            # (independent of the spec_tables argument below).
+            changes = self.discover_context_changes()
+
             # Core pre-purchase funnel
             funnel = self.get_funnel_metrics()
             drop_offs = self.get_drop_off_rates(funnel)
@@ -308,7 +742,7 @@ class AnalyticsAgent:
 
             segments_data = {}
             for table in ["destination_card_clicked", "application_started", "purchase_completed"]:
-                for segment in ["device_type", "geoip_country_code", "funnel_type"]:
+                for segment in self.SEGMENT_CUT_COLUMNS:
                     try:
                         segments = self.analyze_by_segment(segment, table)
                         if segments:
@@ -356,6 +790,10 @@ class AnalyticsAgent:
                 "core_drop_offs": drop_offs,
                 "core_segments": segments_data,
                 "spec_analysis": spec_analysis,
+                "context_changes": {
+                    "newly_instrumented_tables": [t.get("entity_name") for t in changes.get("newly_instrumented_tables", [])],
+                    "open_flags": len(changes.get("open_flags", [])),
+                },
             }
 
             context_summary = "No context available"
@@ -367,7 +805,7 @@ class AnalyticsAgent:
             self.generate_narrative_insights(query_results, context_summary, pm_questions=pm_questions)
 
             return self.insights
-    
+
     def export_insights(self, output_path: Path, format: str = "json"):
         """Export insights to file."""
         data = [
@@ -393,3 +831,31 @@ class AnalyticsAgent:
                 md += f"**Metric:** {i.metric}  \n"
                 md += f"**Value:** {i.value}  \n\n"
             output_path.write_text(md)
+
+
+if __name__ == "__main__":
+    import clickhouse_connect
+    from agents.config import get_config, make_llm_call_fn
+    from agents.context.agent import ContextAgent
+
+    ch_config, lf_config, or_config = get_config()
+    client = clickhouse_connect.get_client(
+        host=ch_config.host,
+        port=ch_config.port,
+        username=ch_config.user,
+        password=ch_config.password,
+        secure=ch_config.secure,
+        database=ch_config.database,
+    )
+
+    context_agent = None
+    if or_config.enabled:
+        context_agent = ContextAgent(client=client, llm_call_fn=make_llm_call_fn(or_config))
+
+    agent = AnalyticsAgent(
+        client=client,
+        database=ch_config.database,
+        context_agent=context_agent,
+        openrouter_config=or_config,
+    )
+    agent.run_interactive()

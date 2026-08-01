@@ -1,42 +1,146 @@
+"""
+Tracing Agent
+Langfuse v4 integration for full pipeline tracing.
+"""
+
+import sys
+import uuid
 from contextlib import contextmanager
+from typing import Any, Dict, Optional
+
 from langfuse import Langfuse
+
 import agents.config
 
 
 class TracingAgent:
 
     def __init__(self):
+        self.enabled = False
+        self.client = None
+        self.current_trace_id: Optional[str] = None
+        self._trace_ctx = None
+
         try:
             _, lf_config, _ = agents.config.get_config()
-            if lf_config.enabled and lf_config.public_key and lf_config.secret_key:
+        except Exception as e:
+            print(f"[Tracing Notice] Could not load Langfuse config: {e}")
+            return
+
+        if lf_config.enabled and lf_config.public_key and lf_config.secret_key:
+            try:
                 self.client = Langfuse(
                     public_key=lf_config.public_key,
                     secret_key=lf_config.secret_key,
                     base_url=lf_config.host,
                 )
-            else:
-                self.client = None
-        except Exception as e:
-            print(f"[Tracing Notice] Could not initialize Langfuse client: {e}")
-            self.client = None
+                self.enabled = True
+            except Exception as e:
+                print(f"[Tracing Notice] Could not initialize Langfuse client: {e}")
+
+    def _active(self) -> bool:
+        return bool(self.enabled and self.client)
+
+    def start_trace(self, name: str, metadata: Dict[str, Any] = None) -> str:
+        """Open a root observation that stays active until end_span()/flush()."""
+        trace_id = str(uuid.uuid4())
+        self.current_trace_id = trace_id
+
+        if self._active():
+            try:
+                self._trace_ctx = self.client.start_as_current_observation(
+                    name=name,
+                    as_type="agent",
+                    input=metadata or {},
+                    metadata=metadata or {},
+                    end_on_exit=False,
+                )
+                self._trace_ctx.__enter__()
+            except Exception as e:
+                print(f"[Tracing Warning] start_trace '{name}' failed: {e}")
+                self._trace_ctx = None
+
+        return trace_id
+
+    def end_span(self, trace_id: str, status: str = "success", error: str = None):
+        """End the root observation opened by start_trace(), if it's still the active one."""
+        if trace_id != self.current_trace_id or self._trace_ctx is None:
+            return
+
+        if self._active():
+            try:
+                self.client.update_current_span(
+                    metadata={"status": status, **({"error": error} if error else {})},
+                    level="ERROR" if status == "error" else "DEFAULT",
+                    status_message=error,
+                )
+            except Exception as e:
+                print(f"[Tracing Warning] end_span failed: {e}")
+
+        try:
+            self._trace_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        self._trace_ctx = None
+        self.current_trace_id = None
 
     @contextmanager
-    def create_trace(self, name: str, input_data: dict = None):
-        """Context manager for an agent trace."""
-        if not self.client:
-            yield TraceWrapper(None)
+    def trace_span(self, name: str, input_data: Dict[str, Any] = None, metadata: Dict[str, Any] = None):
+        """Context manager for a nested span; safe to use bare (`with tracer.trace_span(...):`)."""
+        if not self._active():
+            yield None
             return
 
         try:
+            cm = self.client.start_as_current_observation(
+                name=name,
+                as_type="span",
+                input=input_data or {},
+                metadata=metadata or {},
+            )
+            span = cm.__enter__()
+        except Exception as e:
+            print(f"[Tracing Warning] Span '{name}' failed to start: {e}")
+            yield None
+            return
+
+        try:
+            yield span
+        except BaseException:
+            cm.__exit__(*sys.exc_info())
+            raise
+        else:
+            cm.__exit__(None, None, None)
+
+    def log_generation(self, name: str, model: str, prompt: str, completion: str, metadata: Dict[str, Any] = None):
+        if not self._active():
+            return
+        try:
             with self.client.start_as_current_observation(
                 name=name,
-                as_type="agent",
-                input=input_data or {},
+                as_type="generation",
+                input={"prompt": prompt},
+                output={"completion": completion},
+                metadata={**(metadata or {}), "model": model},
             ):
-                yield TraceWrapper(self.client)
+                pass
         except Exception as e:
-            print(f"[Tracing Warning] Trace '{name}' failed: {e}")
-            yield TraceWrapper(None)
+            print(f"[Tracing Warning] log_generation '{name}' failed: {e}")
+
+    def flush(self):
+        if self._trace_ctx is not None:
+            try:
+                self._trace_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._trace_ctx = None
+            self.current_trace_id = None
+
+        if self._active():
+            try:
+                self.client.flush()
+            except Exception as e:
+                print(f"[Tracing Warning] flush failed: {e}")
 
     def shutdown(self):
         if self.client:
@@ -46,54 +150,16 @@ class TracingAgent:
                 pass
 
 
-class TraceWrapper:
-    """Wrapper that exposes .span() and .update() matching Langfuse observation contexts."""
-
-    def __init__(self, client):
-        self.client = client
-
-    @contextmanager
-    def span(self, name: str, input_data: dict = None):
-        if not self.client:
-            yield SpanWrapper(None)
-            return
-
-        try:
-            with self.client.start_as_current_observation(
-                name=name,
-                as_type="span",
-                input=input_data or {},
-            ):
-                yield SpanWrapper(self.client)
-        except Exception as e:
-            print(f"[Tracing Warning] Span '{name}' failed: {e}")
-            yield SpanWrapper(None)
-
-    def update(self, output=None, metadata: dict = None):
-        if self.client:
-            try:
-                self.client.update_current_observation(
-                    output=output,
-                    metadata=metadata,
-                )
-            except Exception:
-                pass
+_default_tracer: Optional[TracingAgent] = None
 
 
-class SpanWrapper:
-
-    def __init__(self, client):
-        self.client = client
-
-    def end(self, output=None, metadata: dict = None):
-        if self.client:
-            try:
-                self.client.update_current_span(
-                    output=output,
-                    metadata=metadata,
-                )
-            except Exception:
-                pass
+def get_tracer() -> TracingAgent:
+    global _default_tracer
+    if _default_tracer is None:
+        _default_tracer = TracingAgent()
+    return _default_tracer
 
 
-tracer = TracingAgent()
+def set_tracer(tracer: TracingAgent):
+    global _default_tracer
+    _default_tracer = tracer

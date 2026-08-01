@@ -1,5 +1,6 @@
 import argparse
 import re
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,15 @@ from agents.visualization.dashboard_builder import DashboardBuilder
 import dataclasses
 import json
 from collections import defaultdict
+
+
+def _log(stage: str, message: str, t0: float = None) -> None:
+    """Timestamped, stage-tagged console log for pipeline runs -- every major
+    step prints [HH:MM:SS][stage] so an e2e run is traceable start to finish
+    from stdout alone (+ elapsed time once a stage has a start time)."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    elapsed = f" (+{time.monotonic() - t0:.1f}s)" if t0 is not None else ""
+    print(f"[{ts}][{stage}] {message}{elapsed}")
 
 
 def _build_llm_call_fn(or_config):
@@ -76,6 +86,26 @@ def _parse_event_id(value):
             print(f"  Warning: event id '{value}' isn't a valid UUID/hex string, substituting a generated one")
             return str(uuid.uuid4())
     return value
+
+
+def _default_for_column(col):
+    """A raw event can legitimately have a null on a field the generated
+    schema marked non-nullable (e.g. an LLM schema-generation pass deciding
+    `os` is always present, when a web session's raw events never carry
+    one) -- exactly the "known texture" base_context.md flags repeatedly.
+    clickhouse_connect raises client-side on a None in a non-Nullable column
+    and fails the WHOLE batch, not just that row, so substitute a
+    type-appropriate default rather than lose every row in the table."""
+    base_type = col.type.strip()
+    while base_type.startswith("LowCardinality(") and base_type.endswith(")"):
+        base_type = base_type[len("LowCardinality("):-1].strip()
+    if base_type == "UUID":
+        return str(uuid.uuid4())
+    if base_type in ("DateTime", "DateTime64", "Date"):
+        return datetime.now()
+    if base_type.startswith("UInt") or base_type.startswith("Int") or base_type.startswith("Float"):
+        return 0
+    return ""
 
 
 def _flatten_event_row(row: dict) -> dict:
@@ -149,15 +179,17 @@ def run_pipeline(spec_dir: str):
         print(f"Error: {spec_dir} does not exist.")
         return
 
-    print(f"Starting pipeline for spec: {spec_dir}")
-    
+    pipeline_t0 = time.monotonic()
+    _log("pipeline", f"Starting pipeline for spec: {spec_dir}")
+
     # 1. Init Configs & Tracing
     ch_config, lf_config, or_config = get_config()
     tracer = get_tracer()
     tracer.enabled = lf_config.enabled
-    
+    _log("pipeline", f"Tracing {'enabled (Langfuse)' if tracer.enabled else 'disabled -- no LANGFUSE_* configured'}")
+
     trace_id = tracer.start_trace("pipeline_run", metadata={"spec_dir": str(spec_dir)})
-    
+
     try:
         with tracer.trace_span("pipeline.initialize"):
             client = clickhouse_connect.get_client(
@@ -168,9 +200,11 @@ def run_pipeline(spec_dir: str):
                 secure=ch_config.secure,
                 database=ch_config.database,
             )
+        _log("pipeline", f"Connected to ClickHouse at {ch_config.host} (database={ch_config.database})")
 
         # 2. Run ContextAgent
-        print("Running Context Agent...")
+        stage_t0 = time.monotonic()
+        _log("context", "Running Context Agent...")
         with tracer.trace_span("pipeline.context"):
             ensure_control_tables(client)
             llm_call_fn = _build_llm_call_fn(or_config)
@@ -180,9 +214,11 @@ def run_pipeline(spec_dir: str):
                 print(f"  Seeded {seeded} Tier-2 context rows (v1).")
             else:
                 print("  Context layer already seeded, skipping load_v1().")
+        _log("context", "Context Agent done", stage_t0)
 
         # 3. Run InstrumentationAgent
-        print("Running Instrumentation Agent...")
+        stage_t0 = time.monotonic()
+        _log("instrumentation", "Running Instrumentation Agent...")
         with tracer.trace_span("pipeline.instrumentation"):
             print("  Parsing spec and generating schema...")
             ia = InstrumentationAgent(
@@ -237,8 +273,18 @@ def run_pipeline(spec_dir: str):
 
                     column_names = [c.name for c in schema.columns]
                     data_tuples = []
+                    substituted_columns = defaultdict(int)
                     for r in rows:
-                        data_tuples.append(tuple(r.get(col) for col in column_names))
+                        row_values = []
+                        for col in schema.columns:
+                            value = r.get(col.name)
+                            if value is None and not col.nullable:
+                                value = _default_for_column(col)
+                                substituted_columns[col.name] += 1
+                            row_values.append(value)
+                        data_tuples.append(tuple(row_values))
+                    for col_name, n in substituted_columns.items():
+                        print(f"  Warning: {table}.{col_name} is non-nullable but {n} row(s) had no value -- substituted a default")
 
                     try:
                         client.insert(f"{ch_config.database}.{table}", data_tuples, column_names=column_names)
@@ -250,9 +296,11 @@ def run_pipeline(spec_dir: str):
                     print("  Skipped unsupported events:")
                     for table_name, count in missing_tables.items():
                         print(f"    - {table_name}: {count} rows")
+        _log("instrumentation", f"Instrumentation Agent done -- {len(schemas)} table(s), {len(ia.materialized_views)} MV(s)", stage_t0)
 
         # 4. Run AnalyticsAgent
-        print("Running Analytics Agent...")
+        stage_t0 = time.monotonic()
+        _log("analytics", "Running Analytics Agent...")
         with tracer.trace_span("pipeline.analytics"):
             aa = AnalyticsAgent(
                 client=client,
@@ -266,23 +314,26 @@ def run_pipeline(spec_dir: str):
             insights = aa.run_full_analysis(spec_tables=spec_tables, pm_questions=pm_questions, spec_name=spec_name)
             md_out = spec_path / "insight_summary.md"
             aa.export_insights(md_out, format="markdown")
-            print(f"Saved {len(insights)} insights to {md_out}")
+            print(f"  Saved {len(insights)} insights to {md_out}")
+        _log("analytics", f"Analytics Agent done -- {len(insights)} insight(s)", stage_t0)
 
         # 5. Build the dashboard
-        print("Building Dashboard UI...")
+        stage_t0 = time.monotonic()
+        _log("visualization", "Building Dashboard UI...")
         with tracer.trace_span("pipeline.visualization"):
             insights_dicts = [dataclasses.asdict(i) for i in insights]
             builder = DashboardBuilder(insights_dicts, spec_path.name)
             html_out = builder.build_html()
             dash_file = spec_path / "dashboard.html"
             dash_file.write_text(html_out)
-            print(f"Saved interactive dashboard to {dash_file}")
+            print(f"  Saved interactive dashboard to {dash_file}")
+        _log("visualization", "Dashboard done", stage_t0)
 
-        print("Pipeline completed successfully!")
-    
+        _log("pipeline", "Pipeline completed successfully!", pipeline_t0)
+
     except Exception as e:
         tracer.end_span(trace_id, status="error", error=str(e))
-        print(f"Pipeline failed: {e}")
+        _log("pipeline", f"Pipeline FAILED: {e}", pipeline_t0)
         raise
     finally:
         tracer.flush()

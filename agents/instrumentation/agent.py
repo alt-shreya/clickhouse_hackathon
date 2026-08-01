@@ -26,6 +26,20 @@ class ColumnSpec:
     low_cardinality: bool = False
     codec: str = ""
     
+    def valid_codec(self) -> bool:
+        """LLM-generated `codec` values are sometimes garbage -- e.g. it puts a
+        column TYPE ("String") in the codec field instead of leaving it blank.
+        to_ddl() would then emit CODEC(String), which ClickHouse rejects outright
+        (SYNTAX_ERROR), failing the whole CREATE TABLE. Whitelist real ClickHouse
+        codec names (composable, e.g. "Delta, ZSTD(3)") before emitting CODEC(...)."""
+        if not self.codec:
+            return False
+        name = r"(NONE|LZ4|LZ4HC(\(\d+\))?|ZSTD(\(\d+\))?|ZSTD_QAT(\(\d+\))?|DEFLATE_QPL|" \
+               r"Delta(\(\d+\))?|DoubleDelta|Gorilla|FPC(\(\d+\))?|T64|GCD|" \
+               r"AES_128_GCM_SIV|AES_256_GCM_SIV)"
+        pattern = rf"^\s*{name}(\s*,\s*{name})*\s*$"
+        return bool(re.match(pattern, self.codec, re.IGNORECASE))
+
     def to_ch_type(self) -> str:
         """Convert to ClickHouse type string."""
         ch_type = self.type.strip()
@@ -69,9 +83,18 @@ class TableSchema:
         for col in self.columns:
             col_def = f"    {col.name} {col.to_ch_type()}"
             if col.description:
-                col_def += f" COMMENT '{col.description}'"
+                # LLM-written descriptions routinely contain apostrophes ("Referred
+                # user's device type"); unescaped, that closes the SQL string
+                # literal early and breaks the whole CREATE TABLE with a syntax
+                # error at whatever token follows -- same escaping ContextAgent
+                # already does for its ALTER TABLE ... COMMENT calls.
+                desc_escaped = col.description.replace("'", "''")
+                col_def += f" COMMENT '{desc_escaped}'"
             if col.codec:
-                col_def += f" CODEC({col.codec})"
+                if col.valid_codec():
+                    col_def += f" CODEC({col.codec})"
+                else:
+                    print(f"  Warning: dropping invalid codec {col.codec!r} on {self.name}.{col.name}")
             cols.append(col_def)
         
         nl = "\n"
@@ -940,12 +963,14 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         "purchased", "confirmed", "completed", "submitted", "converted", "reconverted",
     )
 
-    def _pick_primary_table(self) -> Optional[TableSchema]:
+    def _pick_primary_table(self, candidates: Optional[List[TableSchema]] = None) -> Optional[TableSchema]:
         """Heuristic for which of this spec's tables is worth a rollup MV: the
         terminal funnel step if one was tagged `kind="funnel"`, else the table
         whose name reads like a conversion/completion event, else the last
-        table generated (usually the end of the spec's event sequence)."""
-        schemas = list(self.schemas.values())
+        table generated (usually the end of the spec's event sequence).
+        `candidates` should be restricted to tables that actually got created --
+        picking one whose CREATE TABLE failed would just fail the MV too."""
+        schemas = candidates if candidates is not None else list(self.schemas.values())
         if not schemas:
             return None
         funnel = [s for s in schemas if s.kind == "funnel"]
@@ -1004,16 +1029,30 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         daily segment-rollup materialized view on this spec's primary table.
         """
         results = {}
+        created_schemas: List[TableSchema] = []
         for schema_name, schema in self.schemas.items():
             ddl = schema.to_ddl(self.database)
 
-            # Execute CREATE TABLE on ClickHouse
+            # Execute CREATE TABLE on ClickHouse. If this fails, the table does
+            # not exist -- registering it in meta_context_registry or invoking
+            # ContextAgent.update_context() (which ALTERs the table to add
+            # comments) would either lie about the table's existence or crash
+            # outright (UNKNOWN_TABLE) and take down every other schema in this
+            # spec along with it. Skip straight to the next table instead.
+            ddl_ok = True
             if self.client:
                 try:
                     self.client.command(ddl)
                     print(f"Executed DDL for table {schema_name}")
                 except Exception as e:
                     print(f"Failed to execute DDL for table {schema_name}: {e}")
+                    ddl_ok = False
+
+            if not ddl_ok:
+                results[schema_name] = {"registered": False, "context_version": None, "ddl_failed": True}
+                continue
+
+            created_schemas.append(schema)
 
             # Register in meta_context_registry
             registered = self.register_table(schema)
@@ -1034,8 +1073,9 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             }
 
         # One rollup MV per spec, on the table worth pre-aggregating (tables must
-        # already exist, so this runs after the create-table loop above).
-        primary = self._pick_primary_table()
+        # already exist, so this runs after the create-table loop above). Only
+        # consider tables that were actually created.
+        primary = self._pick_primary_table(created_schemas)
         if primary is not None:
             mv_ddl = self.generate_materialized_view(primary)
             if mv_ddl:
