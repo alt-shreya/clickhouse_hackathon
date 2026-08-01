@@ -1,9 +1,9 @@
 """
 Analytics Agent
 
-1. Reads straight from the ContextAgent's own tables (agent_control.context_layer,
+1. Reads straight from the ContextAgent's own tables (analytics_context.business_context,
    atlys.meta_context_registry) to see what the Instrumentation/Context agents just
-   did -- newly registered tables, new business rules, open flags -- rather than
+   did -- newly registered tables, the latest business-context document -- rather than
    only trusting whatever a caller happens to pass in.
 2. Turns a natural-language analytics request into ClickHouse SQL. The LLM's ONLY
    job is to write the query text; ClickHouse does all the aggregation once it
@@ -171,16 +171,15 @@ class AnalyticsAgent:
     def discover_context_changes(self) -> Dict[str, Any]:
         """Everything the ContextAgent/InstrumentationAgent currently know:
         every table registered in atlys.meta_context_registry (newest first),
-        plus the unified Tier 1/Tier 2/flags view from ContextAgent.get_latest_context().
-        This is how the Analytics Agent finds out what just got instrumented
-        without needing it handed to it as an argument."""
+        plus the latest version of the unified business-context document from
+        ContextAgent.get_latest_context(). This is how the Analytics Agent
+        finds out what just got instrumented without needing it handed to it
+        as an argument."""
         context = self.context_agent.get_latest_context() if self.context_agent else {}
         return {
             "newly_instrumented_tables": self._registered_tables(),
-            "business_context": context.get("business_context", []),
-            "schema_context": context.get("schema_context", {}),
-            "open_flags": context.get("flags", []),
-            "context_version": context.get("context_version", 0),
+            "business_context_version": context.get("version", 0),
+            "business_context_changelog": context.get("changelog_summary", ""),
         }
 
     def _registered_tables(self) -> List[Dict[str, Any]]:
@@ -215,9 +214,12 @@ class AnalyticsAgent:
             print(f"  - {t.get('entity_name', '?')} (source: {t.get('source_spec') or 'n/a'})")
         if len(tables) > 5:
             print(f"  ...and {len(tables) - 5} more")
-        flags = changes.get("open_flags", [])
-        if flags:
-            print(f"  {len(flags)} open context flag(s) -- treat related numbers with suspicion.")
+        version = changes.get("business_context_version", 0)
+        changelog = changes.get("business_context_changelog", "")
+        if version:
+            print(f"  Business context document at version {version}" + (f" -- {changelog}" if changelog else ""))
+        else:
+            print("  No business context document found (has ContextAgent.load_v1() been run?)")
 
     # ============================================================
     # 2. Natural language -> SQL (LLM writes ONLY the query)
@@ -264,33 +266,18 @@ class AnalyticsAgent:
         return "\n".join(lines) if lines else "(no schema info available)"
 
     def _context_text(self, tables: Optional[List[str]] = None) -> str:
-        """Business context + schema comments + open flags, formatted for an LLM prompt."""
+        """The business-context document, verbatim, for an LLM prompt.
+        `tables` is accepted for interface compatibility but no longer
+        filters anything -- the whole document is the atomic unit now (see
+        agents/context/agent.py); it already includes metrics, known issues,
+        the join map, auto-instrumented tables, and any open flags."""
         if not self.context_agent:
             return "No context agent configured."
-        ctx = self.context_agent.get_latest_context(entities=tables or None)
-        parts = []
-
-        business = ctx.get("business_context", [])
-        if business:
-            parts.append("Business context (metrics, known issues, join map, analysis guidance):")
-            for row in business:
-                parts.append(f"  - [{row.get('value_type', '')}] {row.get('entity', '')}.{row.get('key', '')}: {row.get('value', '')}")
-
-        schema = ctx.get("schema_context", {})
-        if schema.get("tables") or schema.get("columns"):
-            parts.append("Schema comments:")
-            for t in schema.get("tables", []):
-                parts.append(f"  - Table {t.get('entity', '')}: {t.get('comment', '')}")
-            for c in schema.get("columns", []):
-                parts.append(f"  - {c.get('entity', '')}.{c.get('column', '')}: {c.get('comment', '')}")
-
-        flags = ctx.get("flags", [])
-        if flags:
-            parts.append("Open flags -- treat related numbers with suspicion:")
-            for f in flags:
-                parts.append(f"  - [{f.get('flag_type', '')}] {f.get('entity', '')}.{f.get('key', '')}: {f.get('description', '')}")
-
-        return "\n".join(parts) if parts else "No context rows found."
+        ctx = self.context_agent.get_latest_context()
+        content = ctx.get("content", "")
+        if not content:
+            return "No business context document found (has ContextAgent.load_v1() been run?)."
+        return f"Business context document (version {ctx.get('version', '?')}):\n{content}"
 
     def _extract_sql(self, raw: str) -> str:
         text = raw.strip()
@@ -792,16 +779,11 @@ Return only the SQL statement."""
                 "spec_analysis": spec_analysis,
                 "context_changes": {
                     "newly_instrumented_tables": [t.get("entity_name") for t in changes.get("newly_instrumented_tables", [])],
-                    "open_flags": len(changes.get("open_flags", [])),
+                    "business_context_version": changes.get("business_context_version", 0),
                 },
             }
 
-            context_summary = "No context available"
-            if self.context_agent:
-                entities_in_scope = list(self.CORE_FUNNEL_STEPS) + list(spec_tables or [])
-                latest_context = self.context_agent.get_latest_context(entities=entities_in_scope)
-                context_summary = f"Context from ContextAgent:\n{json.dumps(latest_context, indent=2, default=str)}"
-
+            context_summary = self._context_text()
             self.generate_narrative_insights(query_results, context_summary, pm_questions=pm_questions)
 
             return self.insights

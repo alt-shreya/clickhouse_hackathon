@@ -1,60 +1,118 @@
 # test_context_pipeline.py
+"""
+Tests for ContextAgent's document-based business-context model
+(analytics_context.business_context -- one versioned Markdown document, not
+row-decomposed; see agents/context/agent.py). Covers the three behaviors the
+agent is responsible for:
+1. Auto-updating the document when InstrumentationAgent creates a new table.
+2. Downstream consumers (AnalyticsAgent) always reading the latest version.
+3. Surfacing contradictions/gaps/obsolete facts (run_audit) and resolving them.
+
+Uses a small in-memory fake ClickHouse client rather than a MagicMock with many
+side_effect branches -- real enough to exercise the full seed -> update ->
+audit -> resolve read/write cycle (version bumps, content splicing) without a
+live ClickHouse service.
+"""
 import json
+import re
 import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-from agents.instrumentation.agent import InstrumentationAgent, TableSchema, ColumnSpec
+from agents.instrumentation.agent import InstrumentationAgent
+from agents.analytics.agent import AnalyticsAgent
 from agents.context.agent import ContextAgent
 
+
+class FakeContextClient:
+    """Minimal in-memory stand-in for the ClickHouse operations ContextAgent
+    and InstrumentationAgent issue against analytics_context.business_context,
+    atlys.meta_context_registry, and system.tables."""
+
+    def __init__(self):
+        self.business_context_rows = []  # [{doc_id, content, version, changelog_summary, updated_at}]
+        self.registered_tables = set()   # meta_context_registry entity_name
+        self.existing_tables = set()     # system.tables name
+        self.commands = []
+
+    def insert(self, table, rows, column_names=None, settings=None):
+        if table == "analytics_context.business_context":
+            for row in rows:
+                self.business_context_rows.append(dict(zip(column_names, row)))
+        elif table.endswith("meta_context_registry"):
+            idx = column_names.index("entity_name")
+            for row in rows:
+                self.registered_tables.add(row[idx])
+        return None
+
+    def command(self, sql):
+        self.commands.append(sql)
+        m = re.search(r"CREATE TABLE\s+\S+\.(\w+)", sql)
+        if m:
+            self.existing_tables.add(m.group(1))
+        return None
+
+    def query(self, sql):
+        s = sql if isinstance(sql, str) else str(sql)
+        result = MagicMock()
+
+        if "analytics_context.business_context" in s:
+            result.column_names = ["doc_id", "content", "version", "changelog_summary", "updated_at"]
+            if self.business_context_rows:
+                latest = max(self.business_context_rows, key=lambda r: r["version"])
+                result.result_rows = [[latest["doc_id"], latest["content"], latest["version"],
+                                        latest["changelog_summary"], latest["updated_at"]]]
+            else:
+                result.result_rows = []
+            return result
+
+        if "count()" in s.lower() and "meta_context_registry" in s:
+            m = re.search(r"entity_name = '([^']*)'", s)
+            name = m.group(1) if m else None
+            result.column_names = ["count()"]
+            result.result_rows = [[1 if name in self.registered_tables else 0]]
+            return result
+
+        if "DISTINCT entity_name" in s and "meta_context_registry" in s:
+            result.column_names = ["entity_name"]
+            result.result_rows = [[t] for t in sorted(self.registered_tables)]
+            return result
+
+        if "system.tables" in s:
+            result.column_names = ["name"]
+            result.result_rows = [[t] for t in sorted(self.existing_tables)]
+            return result
+
+        # Generic fallback (e.g. InstrumentationAgent._load_registry()'s full listing).
+        result.column_names = []
+        result.result_rows = []
+        return result
+
+
 @pytest.fixture
-def mock_clickhouse_client():
-    """Mock ClickHouse client to prevent actual DB execution during tests."""
-    client = MagicMock()
-    # Mock system queries returning default empty results
-    client.query.return_value.result_rows = []
-    client.query.return_value.column_names = [
-        "version", "entity", "key", "value", "value_type", "source_table", "updated_by", "change_type", "supersedes_version", "confidence"
-    ]
-    return client
+def fake_client():
+    return FakeContextClient()
 
 
 @pytest.fixture
 def mock_llm_call():
-    """Mock LLM response function matching ContextAgent interface."""
+    """Mock LLM response function matching ContextAgent's (prompt, span_name) -> str interface."""
     def _llm_call(prompt: str, span_name: str = "test") -> str:
-        if "schema_comments" in prompt:
-            # Response for update_context
+        if "NEW TABLE:" in prompt:
+            # Response for update_context()
             return json.dumps({
-                "schema_comments": {
-                    "table": "Table tracking user checkout express attempts",
-                    "express_method": "Payment method used for express checkout"
-                },
-                "business_rules": [
-                    {
-                        "key": "express_checkout_conversion_rate",
-                        "value": "count(purchase_completed) / count(express_checkout_shown)",
-                        "value_type": "metric_definition"
-                    }
-                ]
+                "table_blurb_markdown": "- **express_checkout_shown** -- tracks express checkout impressions, keyed by `user_id`.",
+                "changelog_summary": "Documented express_checkout_shown",
             })
-        elif "resolving an open context flag" in prompt:
-            # Response for resolve_flag
+        if "resolving an open flag" in prompt:
+            # Response for resolve_flag()
             return json.dumps({
-                "resolved_value": "count(purchase_completed) / count(express_checkout_shown) WHERE is_success = 1",
-                "resolution_notes": "Unified metric definition to only count successful checkouts."
+                "resolution_notes": "Table was intentionally dropped; the reference is stale and should be removed.",
             })
-        elif "AUDIT_PROMPT" in prompt or "audit" in span_name:
-            # Response for run_audit surfacing a gap/contradiction
-            return json.dumps([
-                {
-                    "entity": "express_checkout_events",
-                    "key": "express_checkout_conversion_rate",
-                    "flag_type": "ambiguous_definition",
-                    "description": "Metric formula missing success filter condition.",
-                    "conflicting_keys": ["express_checkout_conversion_rate"]
-                }
-            ])
+        if "auditing a business-context" in prompt:
+            # Response for run_audit()'s LLM pass -- freshness_check() (deterministic)
+            # supplies the flag in the audit test, so no LLM-found issues here.
+            return "[]"
         return "{}"
     return _llm_call
 
@@ -65,9 +123,8 @@ def sample_spec_dir(tmp_path: Path):
     spec_dir = tmp_path / "express_checkout_spec"
     spec_dir.mkdir()
 
-    # Create spec.md
     spec_md = """# Express Checkout Feature Spec
-    
+
 This spec captures user interactions with the express checkout flow.
 
 Events:
@@ -80,7 +137,6 @@ Properties:
 """
     (spec_dir / "spec.md").write_text(spec_md)
 
-    # Create events.ndjson sample
     events = [
         {
             "id": "11111111-1111-1111-1111-111111111111",
@@ -89,7 +145,7 @@ Properties:
             "application_id": "app_abc",
             "event": "express_checkout_shown",
             "express_method": "apple_pay",
-            "latency_ms": 120
+            "latency_ms": 120,
         }
     ]
     with open(spec_dir / "events.ndjson", "w") as f:
@@ -103,100 +159,91 @@ Properties:
 # TESTS
 # ============================================================================
 
-def test_auto_update_context_on_new_schema(mock_clickhouse_client, mock_llm_call, sample_spec_dir):
+def test_auto_update_context_on_new_schema(fake_client, mock_llm_call, sample_spec_dir):
     """
-    Test 1: Auto-update context layer when new tables or columns are created.
+    Test 1: InstrumentationAgent creating a new table auto-documents it in the
+    business-context document (a new version, not a mutated row).
     """
-    context_agent = ContextAgent(client=mock_clickhouse_client, llm_call_fn=mock_llm_call)
-    
+    context_agent = ContextAgent(client=fake_client, llm_call_fn=mock_llm_call)
+    context_agent.load_v1()
+    assert context_agent.get_latest_context()["version"] == 1
+
     # Spy on update_context
     context_agent.update_context = MagicMock(side_effect=context_agent.update_context)
 
     instrumentation = InstrumentationAgent(
-        clickhouse_client=mock_clickhouse_client,
+        clickhouse_client=fake_client,
         context_agent=context_agent,
-        openrouter_config=None  # Triggers fallback basic parsing for reproducible test
+        openrouter_config=None,  # Triggers fallback basic parsing for reproducible test
     )
 
-    # Run full process_spec pipeline
     schemas = instrumentation.process_spec(sample_spec_dir, execute_ddl=True)
 
     assert len(schemas) > 0
-    # Verify ContextAgent.update_context was called for generated table
     assert context_agent.update_context.called
-    
-    # Check that tier 1 ALTER TABLE MODIFY COMMENT was executed via ClickHouse client
-    command_calls = [call[0][0] for call in mock_clickhouse_client.command.call_args_list]
-    assert any("MODIFY COMMENT" in cmd or "COMMENT COLUMN" in cmd for cmd in command_calls)
+
+    latest = context_agent.get_latest_context()
+    assert latest["version"] >= 2
+    # At least one of the new tables got documented in the Auto-instrumented
+    # tables section, not just silently created.
+    assert any(s.name in latest["content"] for s in schemas)
 
 
-def test_analytics_agent_receives_latest_context(mock_clickhouse_client, mock_llm_call):
+def test_analytics_agent_receives_latest_context(fake_client, mock_llm_call):
     """
-    Test 2: Ensure the Analytics Agent reads a merged view of Tier 1 & Tier 2.
+    Test 2: AnalyticsAgent always reads the LATEST version of the document,
+    including content ContextAgent only just wrote.
     """
-    context_agent = ContextAgent(client=mock_clickhouse_client, llm_call_fn=mock_llm_call)
+    context_agent = ContextAgent(client=fake_client, llm_call_fn=mock_llm_call)
+    context_agent.load_v1()
 
-    # Mock DB returns for Tier 1 & Tier 2
-    mock_clickhouse_client.query.side_effect = [
-        # Tier 2 response
-        MagicMock(
-            column_names=["entity", "key", "value", "value_type", "version"],
-            result_rows=[["express_checkout", "conversion_rate", "count()", "metric_definition", 2]]
-        ),
-        # Tier 1 system.tables
-        MagicMock(column_names=["entity", "comment"], result_rows=[["express_checkout", "Express payment events"]]),
-        # Tier 1 system.columns
-        MagicMock(column_names=["entity", "column", "comment"], result_rows=[["express_checkout", "express_method", "Apple/Google pay"]]),
-        # Open flags
-        MagicMock(column_names=["flag_id", "entity", "key", "flag_type", "description"], result_rows=[])
-    ]
+    next_version = context_agent.update_context(
+        new_table="express_checkout_shown",
+        schema_ddl="CREATE TABLE atlys.express_checkout_shown (id UUID, timestamp DateTime, user_id String)",
+        source_spec="# Express Checkout\nTracks express checkout impressions.",
+    )
+    assert next_version is not None and next_version >= 2
 
-    latest_ctx = context_agent.get_latest_context(entities=["express_checkout"])
+    latest_ctx = context_agent.get_latest_context()
+    assert latest_ctx["version"] == next_version
+    assert "express_checkout_shown" in latest_ctx["content"]
 
-    assert latest_ctx["context_version"] == 2
-    assert len(latest_ctx["schema_context"]["tables"]) == 1
-    assert latest_ctx["schema_context"]["tables"][0]["entity"] == "express_checkout"
-    assert len(latest_ctx["business_context"]) == 1
+    analytics_agent = AnalyticsAgent(client=fake_client, database="atlys", context_agent=context_agent, openrouter_config=None)
+    context_text = analytics_agent._context_text()
+    assert "express_checkout_shown" in context_text
+    assert f"version {next_version}" in context_text
 
-from unittest.mock import MagicMock
 
-def test_surface_and_resolve_context_flags(mock_clickhouse_client, mock_llm_call):
+def test_surface_and_resolve_context_flags(fake_client, mock_llm_call):
     """
-    Test 3: Surface contradictions/gaps and verify resolution workflow.
+    Test 3: Surface an obsolete/stale fact (a registered table that no longer
+    exists -- the literal freshness check Section 9 of the document asks for)
+    and verify the resolve workflow removes it and bumps the version again.
     """
-    context_agent = ContextAgent(client=mock_clickhouse_client, llm_call_fn=mock_llm_call)
+    context_agent = ContextAgent(client=fake_client, llm_call_fn=mock_llm_call)
+    context_agent.load_v1()
 
-    # --- ADD THIS: Route the mock queries to return simulated data ---
-    def mock_query(sql):
-        mock_res = MagicMock()
-        if "context_flags" in sql:
-            # Simulate an open flag existing when resolve_flag() checks for it
-            mock_res.result_rows = [("Simulated conflict description",)]
-            mock_res.column_names = ["description"]
-        else:
-            # Simulate existing context rows for run_audit() to evaluate
-            mock_res.result_rows = [("express_checkout", "formula", "a/b", "metric_definition", 1)]
-            mock_res.column_names = ["entity", "key", "value", "value_type", "version"]
-        return mock_res
-        
-    mock_clickhouse_client.query.side_effect = mock_query
-    # -----------------------------------------------------------------
+    # Simulate a table that was registered but no longer actually exists
+    # (e.g. dropped after the fact) without ever running its CREATE TABLE, so
+    # it's absent from fake_client.existing_tables.
+    fake_client.registered_tables.add("ghost_table")
 
-    # 1. Run audit to surface a flag
-    flags = context_agent.run_audit(scope=["express_checkout"])
-    
-    assert len(flags) > 0
+    flags = context_agent.run_audit()
+    assert len(flags) == 1
+    assert flags[0]["entity"] == "ghost_table"
+    assert flags[0]["flag_type"] == "stale_metric"
 
-    # 2. Extract flag data (adjust keys based on what your mock_llm_call returns)
-    flag_id = "test_flag_123" 
-    entity = flags[0].get("entity", "express_checkout")
-    key = flags[0].get("key", "formula")
+    after_audit = context_agent.get_latest_context()
+    assert after_audit["version"] == 2
+    assert "ghost_table" in after_audit["content"]
 
-    # 3. Resolve the flag
-    context_agent.resolve_flag(flag_id=flag_id, entity=entity, key=key)
+    # Re-running audit on an unchanged document must not re-flag the same issue.
+    assert context_agent.run_audit() == []
+    assert context_agent.get_latest_context()["version"] == 2
 
-    # 4. Verify insertion and status update
-    assert mock_clickhouse_client.insert.called
-    
-    update_calls = [call for call in mock_clickhouse_client.command.call_args_list if "UPDATE status = 'resolved'" in call[0][0]]
-    assert len(update_calls) > 0
+    notes = context_agent.resolve_flag(entity="ghost_table", key="table_existence")
+    assert notes
+
+    resolved = context_agent.get_latest_context()
+    assert resolved["version"] == 3
+    assert "ghost_table" not in resolved["content"]

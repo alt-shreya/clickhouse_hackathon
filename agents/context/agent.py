@@ -1,53 +1,105 @@
 """
 ContextAgent -- the single object every other agent talks to for context.
+
+Business context is ONE whole Markdown document, not decomposed into rows.
+It lives in analytics_context.business_context (doc_id, content, version,
+changelog_summary, updated_at), a ReplacingMergeTree keyed on doc_id: every
+change -- the initial seed, a new table being auto-documented, an audit
+finding a flag, a flag being resolved -- INSERTs a new version rather than
+mutating any row in place, so the table doubles as the full audit trail.
+Callers always read the latest version and inject `content` directly into
+their prompts; there is no per-row filtering to do because the document is
+the atomic unit.
+
 Fixed interface: load_v1, get_latest_context, update_context, run_audit, resolve_flag.
 """
 
 import json
 import re
+from datetime import datetime, timezone
+
 import clickhouse_connect
-from .load_base_context import ROWS, build_insert_rows
-from .audit_base_context import fetch_current_rows, cross_check_against_schema, AUDIT_PROMPT
 
-UPDATE_PROMPT = """A new ClickHouse table has been created for a feature spec.
-Given its DDL and the spec description, produce TWO separate lists:
+from .load_base_context import DOC_ID, AUTO_TABLES_MARKER, OPEN_FLAGS_MARKER, NONE_YET, NONE_OPEN, build_seed_content
+from .audit_base_context import freshness_check, AUDIT_PROMPT, parse_llm_json
 
-1. "schema_comments": one short semantic description per column, plus one for
-   the table's overall role -- this is Tier 1, schema-native metadata, applied
-   as native COMMENT ON TABLE/COLUMN statements. Purely descriptive facts about
-   what a field captures.
-2. "business_rules": ONLY include an entry here if the spec implies something
-   that is NOT just "what a column means" -- e.g. a new metric formula, a new
-   known-issue-style caveat, or a new join relationship to an existing table.
-   Leave this empty if nothing qualifies; most new tables won't need one.
+UPDATE_PROMPT = """A new ClickHouse table was just created for a feature spec. Write a SHORT
+Markdown blurb (3-6 lines, a single bullet or short sub-list, no heading) for a living
+business-context document: what the table captures, its key columns, and how it joins to
+existing entities (user_id / application_id, or a spec-specific id if that's what it
+actually uses). If -- and only if -- the spec clearly implies a NEW metric formula or a
+known-issue-style caveat not already covered below, add ONE short bullet for each;
+otherwise don't invent one.
 
-Respond as JSON: {{"schema_comments": {{"table": "<desc>", "<col>": "<desc>", ...}},
-"business_rules": [{{"key": "...", "value": "...", "value_type": "metric_definition|business_rule|entity_relationship"}}]}}
-No prose, no markdown fences.
+Current "Auto-instrumented tables" entries (context only -- don't duplicate an existing
+metric or caveat):
+{current_entries}
 
-SPEC: {source_spec}
+NEW TABLE: {new_table}
 DDL:
 {schema_ddl}
+
+SPEC IT CAME FROM:
+{source_spec}
+
+Respond as JSON: {{"table_blurb_markdown": "- **{new_table}** -- ...", "changelog_summary": "one line"}}
+No prose, no markdown fences outside the JSON string values.
 """
 
-RESOLVE_PROMPT = """You are resolving an open context flag in an analytics system.
-Flag Description: {description}
-Current Related Context Rows:
-{conflicting_rows}
+RESOLVE_PROMPT = """You are resolving an open flag in a business-context document.
+Entity: {entity}
+Key: {key}
+Flag line: {flag_line}
 
-Provide a single, corrected context value that unifies or supersedes these rules.
-Respond in JSON: {{"resolved_value": "...", "resolution_notes": "..."}}
+Provide a short resolution note explaining how this should be understood/fixed going
+forward (1-3 sentences). Respond in JSON: {{"resolution_notes": "..."}}
 No prose, no markdown fences.
 """
 
+# A flag is rendered as one bullet line, in a format that's both readable and
+# machine-parseable so re-auditing an unchanged document doesn't re-flag the
+# same issue every time (see _existing_flag_keys()).
+_FLAG_LINE_RE = re.compile(r"^- \*\*\[(?P<flag_type>[^\]]+)\]\*\* `(?P<entity>[^`]*)` */ *`(?P<key>[^`]*)`", re.MULTILINE)
 
-def parse_llm_json(raw_text: str):
-    """Safely extracts JSON even if the LLM wraps it in markdown blocks or extra whitespace."""
-    cleaned = raw_text.strip()
-    match = re.search(r'(\{.*\}|\[.*\])', cleaned, re.DOTALL)
-    if match:
-        return json.loads(match.group(1))
-    return json.loads(cleaned)
+# Stops a spliced region at the next top-level heading, the next `---` section
+# divider, or end of document -- whichever comes first. Keeps the divider
+# between sections intact across replacements instead of it being swallowed
+# into whatever gets spliced in.
+_SECTION_STOP = r"(?=\n---\s*\n|\n##\s|\Z)"
+
+
+def _extract_entries(markdown: str, marker: str) -> str:
+    pattern = re.compile(re.escape(marker) + r"\n(.*?)" + _SECTION_STOP, re.DOTALL)
+    match = pattern.search(markdown)
+    return match.group(1) if match else ""
+
+
+def _replace_entries(markdown: str, marker: str, new_body: str) -> str:
+    pattern = re.compile("(" + re.escape(marker) + r"\n)(.*?)" + _SECTION_STOP, re.DOTALL)
+    match = pattern.search(markdown)
+    if not match:
+        raise ValueError(f"Marker {marker!r} not found in document -- was it seeded via build_seed_content()?")
+    return markdown[:match.start(2)] + new_body.strip() + "\n" + markdown[match.end(2):]
+
+
+def _is_empty_placeholder(entries: str) -> bool:
+    stripped = entries.strip()
+    return stripped in ("", NONE_YET, NONE_OPEN)
+
+
+def _render_flag_line(flag: dict) -> str:
+    flag_type = flag.get("flag_type", "ambiguous_definition")
+    entity = flag.get("entity", "")
+    key = flag.get("key", "")
+    description = flag.get("description", "")
+    return f"- **[{flag_type}]** `{entity}` / `{key}` -- {description}"
+
+
+def _existing_flag_keys(entries: str) -> set[tuple[str, str, str]]:
+    return {
+        (m.group("flag_type"), m.group("entity"), m.group("key"))
+        for m in _FLAG_LINE_RE.finditer(entries)
+    }
 
 
 class ContextAgent:
@@ -55,127 +107,80 @@ class ContextAgent:
         self.client = client
         self.llm_call_fn = llm_call_fn  # Wrapped in Langfuse span at call sites
 
-    def load_v1(self, force: bool = False) -> int:
-        """Initializes Tier 2 base context into agent_control.context_layer.
+    # ============================================================
+    # Reading
+    # ============================================================
 
-        Guarded by default: unlike meta_context_registry (ReplacingMergeTree,
-        which collapses duplicate versions on merge), context_layer is a plain
-        MergeTree with no dedup semantics -- calling this twice would leave
-        permanent duplicate seed rows. Pass force=True to reseed anyway.
-        main.py already checks is_context_layer_seeded() before calling this;
-        this guard covers direct/notebook callers too.
+    def _latest_doc(self, doc_id: str = DOC_ID) -> dict:
+        query = f"""
+            SELECT doc_id, content, version, changelog_summary, updated_at
+            FROM analytics_context.business_context
+            WHERE doc_id = '{doc_id}'
+            ORDER BY version DESC
+            LIMIT 1
         """
-        if not force:
-            existing = self.client.query("SELECT count() FROM agent_control.context_layer").result_rows[0][0]
-            if existing > 0:
-                print(f"agent_control.context_layer already has {existing} rows -- skipping load_v1() (pass force=True to reseed anyway).")
-                return 0
+        result = self.client.query(query)
+        if not result.result_rows:
+            return {"doc_id": doc_id, "content": "", "version": 0, "changelog_summary": "", "updated_at": None}
+        return dict(zip(result.column_names, result.result_rows[0]))
 
-        records = build_insert_rows(ROWS)
+    def get_latest_context(self, entities: list[str] | None = None) -> dict:
+        """Returns the latest version of the unified business-context document:
+        {doc_id, content, version, changelog_summary, updated_at}.
+
+        `entities` is accepted for backward compatibility with callers written
+        against the old per-row context model, but no longer filters anything --
+        the document is one atomic whole now, so callers inject `content`
+        directly into their prompts rather than filtering structured rows.
+        """
+        return self._latest_doc()
+
+    def _insert_version(self, content: str, version: int, changelog_summary: str, doc_id: str = DOC_ID) -> None:
         # async_insert=0: forces a synchronous, durable write. This ClickHouse
         # Cloud service defaults to async_insert=1 (server-side buffering before
         # a background flush); observed live, rapid-fire small control-plane
-        # inserts (e.g. InstrumentationAgent.register_table() called once per
-        # generated table) silently lost rows when the process moved on before
-        # the async buffer flushed. All of ContextAgent's writes are low-volume
-        # and correctness-critical, so pay the sync cost here.
+        # inserts silently lost rows when the process moved on before the async
+        # buffer flushed. Every write here is low-volume and correctness-critical.
         self.client.insert(
-            "agent_control.context_layer",
-            [list(r.values()) for r in records],
-            column_names=list(records[0].keys()),
+            "analytics_context.business_context",
+            [[doc_id, content, version, changelog_summary, datetime.now(timezone.utc)]],
+            column_names=["doc_id", "content", "version", "changelog_summary", "updated_at"],
             settings={"async_insert": 0},
         )
-        return len(records)
 
-    def get_latest_context(self, entities: list[str] | None = None) -> dict:
-        """Returns a unified view merging both context tiers:
-        - Tier 1: Native COMMENTs on atlys.* tables/columns (metadata)
-        - Tier 2: agent_control.context_layer (metrics, known issues, joins)
-        - Active Flags: Open warnings for the Analytics Agent
+    # ============================================================
+    # Seeding
+    # ============================================================
+
+    def load_v1(self, force: bool = False) -> int:
+        """Seeds version 1 of the business-context document from base_context.md
+        (plus the operational sections -- auto-instrumented tables, freshness
+        check, open flags -- appended by build_seed_content()).
+
+        Guarded by default: analytics_context.business_context is a plain
+        ReplacingMergeTree with no dedup until merge, so calling this twice
+        would leave a stray duplicate version=1 row until the background merge
+        catches up. Pass force=True to reseed anyway.
         """
-        tier2 = self._get_tier2(entities)
-        tier1 = self._get_tier1(entities)
-        flags = self._open_flags(entities)
-        max_version = max((r["version"] for r in tier2), default=0)
-        return {
-            "schema_context": tier1,     # Table/column comments from system.columns/tables
-            "business_context": tier2,   # Versioned rows: metrics/known-issues/joins
-            "flags": flags,              # Open contradictions or ambiguities
-            "context_version": max_version,
-        }
+        if not force:
+            existing = self._latest_doc()
+            if existing["version"] > 0:
+                print(f"analytics_context.business_context already seeded ({DOC_ID} at version {existing['version']}) -- skipping load_v1() (pass force=True to reseed anyway).")
+                return 0
 
-    def _get_tier2(self, entities: list[str] | None) -> list[dict]:
-        where = ""
-        if entities:
-            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
-            where = f"WHERE entity IN ({in_list})"
-        # The inner query aliases max(version) as `latest_version`, not `version`
-        # -- naming it `version` (matching the raw column being aggregated) makes
-        # ClickHouse substitute that alias into the HAVING clause's separate
-        # argMax(change_type, version) call, producing an illegal aggregate
-        # nested inside an aggregate (ILLEGAL_AGGREGATION, code 184). The outer
-        # SELECT renames it back to `version` so the returned dict shape is
-        # unchanged for callers.
-        query = f"""
-            SELECT entity, key, value, value_type, latest_version AS version
-            FROM (
-                SELECT entity, key,
-                       argMax(value, version) AS value,
-                       argMax(value_type, version) AS value_type,
-                       max(version) AS latest_version
-                FROM agent_control.context_layer
-                {where}
-                GROUP BY entity, key
-                HAVING argMax(change_type, version) != 'deprecation'
-            )
-            ORDER BY entity, key
-        """
-        result = self.client.query(query)
-        return [dict(zip(result.column_names, r)) for r in result.result_rows]
+        content = build_seed_content()
+        self._insert_version(content=content, version=1, changelog_summary="Initial seed from base_context.md")
+        return 1
 
-    def _get_tier1(self, entities: list[str] | None) -> dict:
-        table_filter = ""
-        col_filter = ""
-        if entities:
-            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
-            table_filter = f"AND name IN ({in_list})"
-            col_filter = f"AND table IN ({in_list})"
-
-        tables = self.client.query(f"""
-            SELECT name AS entity, comment
-            FROM system.tables
-            WHERE database = 'atlys' AND comment != '' {table_filter}
-        """)
-        columns = self.client.query(f"""
-            SELECT table AS entity, name AS column, comment
-            FROM system.columns
-            WHERE database = 'atlys' AND comment != '' {col_filter}
-        """)
-        return {
-            "tables": [dict(zip(tables.column_names, r)) for r in tables.result_rows],
-            "columns": [dict(zip(columns.column_names, r)) for r in columns.result_rows],
-        }
-
-    def _open_flags(self, entities: list[str] | None) -> list[dict]:
-        where = "WHERE status = 'open'"
-        if entities:
-            in_list = ",".join(f"'{e.replace('\'', '\'\'')}'" for e in entities)
-            where += f" AND entity IN ({in_list})"
-        result = self.client.query(f"""
-            SELECT flag_id, entity, key, flag_type, description
-            FROM agent_control.context_flags {where}
-        """)
-        return [dict(zip(result.column_names, r)) for r in result.result_rows]
+    # ============================================================
+    # LLM plumbing
+    # ============================================================
 
     def _call_llm_json(self, prompt: str, span_name: str):
         """Call the LLM and parse its JSON response, returning None on any
-        failure (API error -- e.g. free-tier rate limits, which is a known,
-        already-documented risk of the shared OpenRouter free model -- or
-        malformed JSON) instead of raising. Every other LLM call site in this
-        codebase (Instrumentation/Analytics agents) already degrades gracefully
-        on LLM failure; these three call sites previously had none at all, so
-        a single rate-limited call took the whole pipeline down.
-        """
+        failure (API error or malformed JSON) instead of raising -- every
+        other LLM call site in this codebase already degrades gracefully on
+        LLM failure, so a single flaky call doesn't take the whole pipeline down."""
         try:
             try:
                 raw = self.llm_call_fn(prompt, span_name=span_name)
@@ -186,137 +191,169 @@ class ContextAgent:
             print(f"Warning: ContextAgent LLM call ({span_name}) failed, skipping: {e}")
             return None
 
-    def run_audit(self, scope: list[str] | None = None) -> list[dict]:
-        if scope is None:
-            print("WARNING: run_audit() called with scope=None -- auditing ENTIRE context layer.")
-
-        rows = fetch_current_rows(self.client) if scope is None else self._get_tier2(entities=scope)
-        if not rows:
-            return []
-
-        prompt = AUDIT_PROMPT.format(rows_json=json.dumps(rows, indent=2, default=str))
-        flags = self._call_llm_json(prompt, "context_audit")
-        if flags is None:
-            return []
-        if not isinstance(flags, list):
-            flags = [flags] if isinstance(flags, dict) else []
-
-        flags = cross_check_against_schema(self.client, flags)
-
-        # Dedup against already-open flags for the same (entity, key, flag_type).
-        # Without this, re-running run_audit() on an unchanged context layer --
-        # e.g. every update_context() call re-audits its own scope -- re-flags
-        # the same issue every time, and context_flags grows unbounded noise
-        # instead of staying a legible "open issues" list. .get() throughout:
-        # _open_flags() rows may not carry every key depending on what the
-        # caller's ClickHouse client mock/schema returns.
-        existing_open = {
-            (f.get("entity", ""), f.get("key", ""), f.get("flag_type", ""))
-            for f in self._open_flags(entities=scope)
-        }
-        flags = [
-            f for f in flags
-            if (f.get("entity", ""), f.get("key", ""), f.get("flag_type", "ambiguous_definition")) not in existing_open
-        ]
-
-        if flags:
-            self.client.insert(
-                "agent_control.context_flags",
-                [[f.get("entity", ""), f.get("key", ""), f.get("flag_type", "ambiguous_definition"),
-                  f.get("description", ""), f.get("conflicting_keys", []), "open"] for f in flags],
-                column_names=["entity", "key", "flag_type", "description",
-                              "conflicting_versions", "status"],
-                settings={"async_insert": 0},
-            )
-        return flags
+    # ============================================================
+    # Auto-update on new tables
+    # ============================================================
 
     def update_context(self, new_table: str, schema_ddl: str, source_spec: str) -> int | None:
-        prompt = UPDATE_PROMPT.format(source_spec=source_spec, schema_ddl=schema_ddl)
-        parsed = self._call_llm_json(prompt, "context_update")
-        if parsed is None:
-            print(f"Skipping context update for {new_table} (LLM call failed) -- table was still created, just without Tier 1/2 enrichment.")
+        """Invoked by InstrumentationAgent right after a new table is created.
+        Asks the LLM for a short blurb documenting the table (not a rewrite of
+        the whole document -- see module docstring for why), appends it under
+        Section 8 (Auto-instrumented tables), writes a new version, then
+        re-audits so any new contradiction/gap/staleness this table introduces
+        gets surfaced in the same pass.
+        """
+        latest = self._latest_doc()
+        if latest["version"] == 0:
+            print(f"Warning: business context not seeded yet -- call load_v1() first. Skipping update_context for {new_table}.")
             return None
 
-        # --- Tier 1: Native ClickHouse Comments ---
-        schema_comments = parsed.get("schema_comments", {})
-        for field, desc in schema_comments.items():
-            desc_escaped = str(desc).replace("'", "''")
-            if field == "table":
-                self.client.command(f"ALTER TABLE atlys.{new_table} MODIFY COMMENT '{desc_escaped}'")
-            else:
-                self.client.command(f"ALTER TABLE atlys.{new_table} COMMENT COLUMN {field} '{desc_escaped}'")
+        current_entries = _extract_entries(latest["content"], AUTO_TABLES_MARKER)
+        prompt = UPDATE_PROMPT.format(
+            current_entries=current_entries if not _is_empty_placeholder(current_entries) else NONE_YET,
+            new_table=new_table,
+            schema_ddl=schema_ddl,
+            source_spec=(source_spec or "")[:4000],
+        )
+        parsed = self._call_llm_json(prompt, "context_update")
+        if parsed is None:
+            print(f"Skipping context update for {new_table} (LLM call failed) -- table was still created, just without context enrichment.")
+            return None
 
-        # --- Tier 2: Business Rules ---
-        business_rules = parsed.get("business_rules", [])
-        next_version = None
-        if business_rules:
-            current = {(r["entity"], r["key"]): r for r in self._get_tier2(None)}
-            next_version = max((r["version"] for r in current.values()), default=1) + 1
-            
-            # Format tuples for build_insert_rows
-            new_tuples = [
-                (new_table, nr["key"], str(nr["value"]), nr.get("value_type", "business_rule"), new_table)
-                for nr in business_rules
-            ]
-            
-            # Generate dicts with updated_at included natively
-            insert_records = build_insert_rows(new_tuples, version=next_version, updated_by="context_agent_llm")
-            
-            # Reconcile overrides for specific updates vs corrections
-            for rec in insert_records:
-                existing = current.get((rec["entity"], rec["key"]))
-                if existing and existing["value"] != rec["value"]:
-                    rec["change_type"] = "correction"
-                    rec["supersedes_version"] = existing["version"]
-            
-            self.client.insert(
-                "agent_control.context_layer",
-                [list(r.values()) for r in insert_records],
-                column_names=list(insert_records[0].keys()),
-                settings={"async_insert": 0},
-            )
+        blurb = str(parsed.get("table_blurb_markdown", "")).strip()
+        if not blurb:
+            print(f"Skipping context update for {new_table} -- LLM returned no blurb.")
+            return None
 
-        # Re-audit new scope
+        new_entries = blurb if _is_empty_placeholder(current_entries) else f"{current_entries.rstrip()}\n\n{blurb}"
+        new_content = _replace_entries(latest["content"], AUTO_TABLES_MARKER, new_entries)
+
+        next_version = latest["version"] + 1
+        changelog = str(parsed.get("changelog_summary") or f"Added {new_table}")
+        self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
+        print(f"Updated business context to version {next_version}: {changelog}")
+
+        # Re-audit new state -- only writes yet another version if it actually finds something new.
         self.run_audit(scope=[new_table])
         return next_version
 
-    def resolve_flag(self, flag_id: str, entity: str, key: str) -> None:
-        """Resolves an open flag by generating a corrected Tier 2 rule and updating flag status."""
-        flag = self.client.query(
-            f"SELECT description FROM agent_control.context_flags WHERE flag_id = '{flag_id}' AND status = 'open'"
-        ).result_rows
-        if not flag:
-            return
+    # ============================================================
+    # Auditing -- contradictions/gaps (LLM) + obsolete data (deterministic)
+    # ============================================================
 
-        conflicting_rows = self._get_tier2(entities=[entity])
-        prompt = RESOLVE_PROMPT.format(description=flag[0][0], conflicting_rows=json.dumps(conflicting_rows))
+    def run_audit(self, scope: list[str] | None = None) -> list[dict]:
+        """Surfaces contradictions, gaps, and obsolete/stale facts in the
+        business-context document:
+        - freshness_check(): deterministic, no LLM -- does every table
+          InstrumentationAgent has registered still actually exist? This is
+          exactly the check Section 9 (Data freshness check) tells readers to
+          run; running it here means the document polices its own staleness.
+        - An LLM pass over the full document for contradictions/ambiguity it
+          can support from the text alone.
+
+        New flags (deduped against ones already listed under Section 10) are
+        appended there and a new version is written; if nothing new is found,
+        no version is written and an empty list is returned -- re-running audit
+        on an unchanged document doesn't pile up duplicate flags or noise the
+        version history.
+
+        Known limitation: dedup is exact-match on (flag_type, entity, key) plus
+        showing the LLM the already-flagged list in-prompt -- freshness_check()'s
+        flags are deterministic so this is exact, but the LLM's own entity/key
+        choice for the SAME underlying contradiction isn't perfectly stable
+        across independent calls (observed live: `metric.conversion_rate`/
+        `session_undefined` vs `entity.session`/`session_undefined` for what's
+        the same issue). Calling run_audit() repeatedly with no document change
+        in between can occasionally add a near-duplicate, differently-worded
+        flag rather than recognizing it as one already raised. A text-similarity
+        heuristic was tried and rejected -- it scored two genuinely different
+        freshness flags (different table, near-identical template sentence) as
+        MORE similar than two genuinely-the-same LLM flags (same issue, very
+        different phrasing), so it would suppress real distinct flags rather
+        than catch true duplicates.
+        """
+        latest = self._latest_doc()
+        if latest["version"] == 0:
+            print("Warning: business context not seeded yet -- call load_v1() first. Skipping run_audit().")
+            return []
+
+        current_entries = _extract_entries(latest["content"], OPEN_FLAGS_MARKER)
+        existing_keys = _existing_flag_keys(current_entries)
+
+        flags = list(freshness_check(self.client))
+
+        # Showing the LLM what's already flagged is the primary defense against
+        # re-flagging the same issue reworded (e.g. `metric.conversion_rate` /
+        # `session_undefined` vs `entity.session` / `session_undefined` on two
+        # different audit passes -- observed live, since entity/key are LLM
+        # free text, not a stable identifier). The exact-tuple check below is
+        # a secondary safety net, not the primary mechanism.
+        audit_prompt = AUDIT_PROMPT.format(
+            document=latest["content"][:16000],
+            existing_flags=current_entries if not _is_empty_placeholder(current_entries) else "(none yet)",
+        )
+        llm_flags = self._call_llm_json(audit_prompt, "context_audit")
+        if isinstance(llm_flags, list):
+            flags.extend(f for f in llm_flags if isinstance(f, dict))
+        elif isinstance(llm_flags, dict):
+            flags.append(llm_flags)
+
+        new_flags = [
+            f for f in flags
+            if (f.get("flag_type", "ambiguous_definition"), f.get("entity", ""), f.get("key", "")) not in existing_keys
+        ]
+        if not new_flags:
+            return []
+
+        new_lines = "\n".join(_render_flag_line(f) for f in new_flags)
+        updated_entries = new_lines if _is_empty_placeholder(current_entries) else f"{current_entries.rstrip()}\n{new_lines}"
+        new_content = _replace_entries(latest["content"], OPEN_FLAGS_MARKER, updated_entries)
+
+        next_version = latest["version"] + 1
+        scope_note = f" (scope: {', '.join(scope)})" if scope else ""
+        changelog = f"Audit found {len(new_flags)} new flag(s){scope_note}"
+        self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
+        print(f"Updated business context to version {next_version}: {changelog}")
+        return new_flags
+
+    # ============================================================
+    # Resolving a flag
+    # ============================================================
+
+    def resolve_flag(self, entity: str, key: str) -> str | None:
+        """Resolves an open flag matching (entity, key): asks the LLM for a
+        resolution note, removes the flag line from Section 10, and writes a
+        new version whose changelog records the resolution. Returns the
+        resolution note, or None if no matching open flag was found (or the
+        LLM call failed).
+        """
+        latest = self._latest_doc()
+        if latest["version"] == 0:
+            return None
+
+        current_entries = _extract_entries(latest["content"], OPEN_FLAGS_MARKER)
+        lines = current_entries.splitlines()
+        matching = [ln for ln in lines if f"`{entity}`" in ln and f"`{key}`" in ln]
+        if not matching:
+            print(f"No open flag found for {entity}.{key}")
+            return None
+
+        prompt = RESOLVE_PROMPT.format(entity=entity, key=key, flag_line=matching[0])
         res = self._call_llm_json(prompt, "context_resolve")
         if res is None:
-            print(f"Skipping resolution for flag {flag_id} (LLM call failed).")
-            return
-        resolved_value = res.get("resolved_value", "")
+            print(f"Skipping resolution for {entity}.{key} (LLM call failed).")
+            return None
+        resolution_notes = str(res.get("resolution_notes", ""))
 
-        if resolved_value:
-            latest_v = max([r["version"] for r in conflicting_rows], default=1) + 1
-            
-            # Leverage build_insert_rows to handle correct dict scaffolding and updated_at
-            resolve_tuple = [(entity, key, resolved_value, "business_rule", entity)]
-            resolve_records = build_insert_rows(resolve_tuple, version=latest_v, updated_by="context_agent_resolve")
-            
-            # Override for correction
-            resolve_records[0]["change_type"] = "correction"
-            resolve_records[0]["supersedes_version"] = latest_v - 1
-            
-            self.client.insert(
-                "agent_control.context_layer",
-                [list(r.values()) for r in resolve_records],
-                column_names=list(resolve_records[0].keys()),
-                settings={"async_insert": 0},
-            )
+        remaining = [ln for ln in lines if ln not in matching]
+        new_entries = "\n".join(remaining) if remaining else NONE_OPEN
+        new_content = _replace_entries(latest["content"], OPEN_FLAGS_MARKER, new_entries)
 
-        self.client.command(
-            f"ALTER TABLE agent_control.context_flags UPDATE status = 'resolved', resolved_at = now() WHERE flag_id = '{flag_id}'"
-        )
+        next_version = latest["version"] + 1
+        changelog = f"Resolved flag {entity}.{key}: {resolution_notes}"
+        self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
+        print(f"Updated business context to version {next_version}: {changelog}")
+        return resolution_notes
 
 
 if __name__ == "__main__":

@@ -1,62 +1,49 @@
 """
 Reproducible setup for the control-plane tables the agents depend on:
-- agent_control.context_layer   (Tier-2 versioned business context; ContextAgent)
-- agent_control.context_flags   (open contradictions/gaps found by ContextAgent.run_audit)
-- atlys.meta_context_registry   (InstrumentationAgent's registry of generated tables)
+- analytics_context.business_context   (versioned business-context Markdown document; ContextAgent)
+- atlys.meta_context_registry          (InstrumentationAgent's registry of generated tables)
 
 These previously existed only as hand-created tables on the live ClickHouse Cloud
 service with no DDL checked into the repo. This module makes that reproducible:
 call `ensure_control_tables(client)` once at the start of the pipeline (main.py
 does this) and it's a no-op if everything already exists with the right shape.
 
-Note: `context_flags.conflicting_versions` is `Array(String)`, not `Array(UInt32)`.
-The column holds "entity.key" identifiers (per audit_base_context.AUDIT_PROMPT),
-not version numbers -- an earlier hand-created version of this table had the wrong
-type, which meant every audit flag with non-empty conflicting_keys silently failed
-to insert.
+Note: agent_control.context_layer / agent_control.context_flags (the old row-per-
+fact Tier-2 model + separate flags table) are retired -- superseded by
+analytics_context.business_context, which stores the whole business-context
+document as Markdown text per version instead of decomposing it into atomic
+rows. See agents/context/agent.py for why. This module no longer creates them;
+if they still exist on a given ClickHouse service from before this change, drop
+them manually -- ensure_control_tables() only ever creates, never drops.
 """
 
 import clickhouse_connect
 
 
 def ensure_control_tables(client) -> None:
-    client.command("CREATE DATABASE IF NOT EXISTS agent_control")
+    client.command("CREATE DATABASE IF NOT EXISTS analytics_context")
 
     client.command("""
-        CREATE TABLE IF NOT EXISTS agent_control.context_layer
+        CREATE TABLE IF NOT EXISTS analytics_context.business_context
         (
+            doc_id String,
+            content String,
             version UInt32,
-            entity String,
-            key String,
-            value String,
-            value_type LowCardinality(String),
-            source_table String,
-            updated_by LowCardinality(String),
-            change_type LowCardinality(String),
-            supersedes_version Nullable(UInt32),
-            confidence Float32 DEFAULT 1.,
+            changelog_summary String,
             updated_at DateTime DEFAULT now()
         )
-        ENGINE = MergeTree
-        ORDER BY (entity, key, version)
+        ENGINE = ReplacingMergeTree(version)
+        ORDER BY (doc_id)
     """)
-
-    client.command("""
-        CREATE TABLE IF NOT EXISTS agent_control.context_flags
-        (
-            flag_id UUID DEFAULT generateUUIDv4(),
-            entity String,
-            key String,
-            flag_type LowCardinality(String),
-            description String,
-            conflicting_versions Array(String),
-            status LowCardinality(String) DEFAULT 'open',
-            detected_at DateTime DEFAULT now(),
-            resolved_at Nullable(DateTime)
-        )
-        ENGINE = MergeTree
-        ORDER BY (entity, flag_type, detected_at)
-    """)
+    # ReplacingMergeTree(version) only -- deliberately WITHOUT the optional
+    # is_deleted parameter. agents/setup.py (the old meta_context_registry
+    # table) already documents the footgun this avoids: binding a table's
+    # "current" semantics to ReplacingMergeTree's is_deleted purges the WHOLE
+    # duplicate-key group on merge, not just the losing rows. Every read here
+    # goes through ContextAgent._latest_doc()'s `ORDER BY version DESC LIMIT 1`
+    # rather than relying on merge-time dedup anyway, so this table only needs
+    # ReplacingMergeTree to eventually collapse old versions for storage, never
+    # to decide correctness.
 
     client.command("""
         CREATE TABLE IF NOT EXISTS atlys.meta_context_registry
@@ -95,8 +82,8 @@ def ensure_control_tables(client) -> None:
     # merge-time dedup only needs to keep the latest version, never delete rows.
 
 
-def is_context_layer_seeded(client) -> bool:
-    result = client.query("SELECT count() FROM agent_control.context_layer")
+def is_business_context_seeded(client) -> bool:
+    result = client.query("SELECT count() FROM analytics_context.business_context")
     return result.result_rows[0][0] > 0
 
 

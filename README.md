@@ -10,11 +10,15 @@ schema, loads its sample events, and produces PM-readable insights:
   (via `windowFunnel`, not independent per-table counts) over both the core funnel
   and the spec's own new tables, plus LLM narrative insights that answer the
   spec's own "Questions the PM will ask".
-- **Context Agent** (`agents/context/`) — a two-tier living context layer: native
-  ClickHouse `COMMENT`s on `atlys.*` tables/columns (Tier 1, schema-native facts)
-  plus a versioned `agent_control.context_layer` table (Tier 2, metrics/known
-  issues/join map), with an LLM audit pass that surfaces contradictions/gaps
-  into `agent_control.context_flags`.
+- **Context Agent** (`agents/context/`) — a living business-context layer stored as
+  ONE whole Markdown document per version in `analytics_context.business_context`
+  (`doc_id`, `content`, `version`, `changelog_summary`, `updated_at`; a
+  ReplacingMergeTree keyed on `doc_id` -- every change INSERTs a new version rather
+  than mutating a row, so the table is also the audit trail). Seeded from
+  `base_context.md`; auto-documents new tables under its "Auto-instrumented tables"
+  section as InstrumentationAgent creates them; a deterministic freshness check
+  (does every registered table still exist?) plus an LLM pass surface
+  contradictions/gaps/obsolete facts into its "Open flags" section.
 - **Tracing** (`agents/tracing/`) — Langfuse spans/generations across all three
   agents, with a local JSONL fallback if Langfuse isn't configured.
 - **Visualization** (`agents/visualization/dashboard_builder.py`) — a self-contained
@@ -28,14 +32,15 @@ All three agents share one LLM provider (OpenRouter, OpenAI-compatible) — see
 1. **Python deps**: `pip install -r requirements.txt`
 2. **Copy `.env.example` to `.env`** and fill in:
    - `CLICKHOUSE_HOST` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` (ClickHouse Cloud service)
-   - `OPENROUTER_API_KEY` (get one at https://openrouter.ai/keys) — without this,
-     every agent still runs, but falls back to rule-based logic instead of LLM
-     reasoning (schema generation, narrative insights, context audit all degrade
-     gracefully rather than crashing).
+   - `ANTHROPIC_API_KEY` (preferred LLM provider -- see `agents/config.py:AnthropicConfig`,
+     default model `claude-haiku-4-5-20251001`) or `OPENROUTER_API_KEY` (fallback if
+     Anthropic isn't set). Without either, every agent still runs, but falls back to
+     rule-based logic instead of LLM reasoning (schema generation, narrative insights,
+     context audit all degrade gracefully rather than crashing).
    - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (optional, for tracing)
 3. **Load the base dataset** (8 existing funnel/engagement tables, ~2.5M rows) into
    your ClickHouse Cloud service per the challenge package's `data/load.sh`.
-4. **Control-plane tables** (`agent_control.context_layer`, `agent_control.context_flags`,
+4. **Control-plane tables** (`analytics_context.business_context`,
    `atlys.meta_context_registry`) are created automatically by `main.py` on first
    run via `agents/setup.py:ensure_control_tables()` (`CREATE TABLE IF NOT EXISTS`,
    idempotent). No manual step needed.
@@ -60,8 +65,11 @@ writes, into the spec directory:
 - `meta_context_registry.columns` is `Array(Tuple(name, type, description))` —
   registration writes must match this shape exactly (see
   `InstrumentationAgent.register_table()`); a raw JSON string does not parse.
-- `agent_control.context_flags.conflicting_versions` is `Array(String)` (holds
-  `"entity.key"` identifiers, not version numbers).
+- `analytics_context.business_context` never gets mutated in place -- every
+  change (seed, auto-documented table, audit flag, resolved flag) is a new
+  `INSERT` with `version = previous + 1`; readers always
+  `ORDER BY version DESC LIMIT 1` rather than relying on background-merge
+  dedup. See `agents/context/agent.py` module docstring.
 - `ContextAgent.run_audit()` dedups against already-open flags for the same
   `(entity, key, flag_type)` before inserting, so re-running the pipeline on an
   unchanged context layer doesn't pile up duplicate flags.

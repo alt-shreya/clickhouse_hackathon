@@ -58,21 +58,15 @@ def mock_openrouter():
 def mock_context_agent():
     agent = MagicMock(spec=ContextAgent)
     agent.get_latest_context.return_value = {
-        "schema_context": {
-            "tables": [{"entity": "purchase_completed", "comment": "Tracks successful checkouts"}],
-            "columns": [{"entity": "purchase_completed", "column": "device_type", "comment": "User device category"}]
-        },
-        "business_context": [
-            {
-                "entity": "purchase_completed",
-                "key": "otp_flow_latency",
-                "value": "New OTP verification introduces a 2s latency spike on mobile web.",
-                "value_type": "business_rule",
-                "version": 1
-            }
-        ],
-        "flags": [],
-        "context_version": 1
+        "doc_id": "atlys_base_context",
+        "content": (
+            "## 5. Known-issues log\n\n"
+            "1. **K1** -- New OTP verification introduces a 2s latency spike on mobile web,\n"
+            "   causing drop-offs on `purchase_completed`.\n"
+        ),
+        "version": 1,
+        "changelog_summary": "Initial seed from base_context.md",
+        "updated_at": None,
     }
     return agent
 

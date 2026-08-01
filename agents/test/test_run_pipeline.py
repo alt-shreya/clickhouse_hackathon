@@ -27,19 +27,18 @@ def test_run_pipeline_with_real_context_agent():
     # 3. Initialize the REAL ContextAgent using its true constructor signature
     context_agent = ContextAgent(client=mock_client, llm_call_fn=mock_llm_call)
 
-    # Mock the return value of get_latest_context so AnalyticsAgent gets data structure it expects
+    # Mock the return value of get_latest_context so AnalyticsAgent gets the
+    # data structure it expects: the unified business-context document.
     context_agent.get_latest_context = MagicMock(return_value={
-        "schema_context": {"tables": [], "columns": []},
-        "business_context": [
-            {
-                "entity": "purchase_completed",
-                "key": "otp_flow_latency",
-                "value": "New OTP verification introduces a 2s latency spike on mobile web, causing drop-offs.",
-                "value_type": "business_rule"
-            }
-        ],
-        "flags": [],
-        "context_version": 1
+        "doc_id": "atlys_base_context",
+        "content": (
+            "## 5. Known-issues log\n\n"
+            "1. **K1** -- New OTP verification introduces a 2s latency spike on mobile web, "
+            "causing drop-offs on `purchase_completed`.\n"
+        ),
+        "version": 1,
+        "changelog_summary": "Initial seed from base_context.md",
+        "updated_at": None,
     })
 
     # 4. Mock LLM Config for AnalyticsAgent

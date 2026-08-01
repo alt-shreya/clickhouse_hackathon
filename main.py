@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import clickhouse_connect
 from agents.config import get_config, make_llm_call_fn
-from agents.setup import ensure_control_tables, is_context_layer_seeded
+from agents.setup import ensure_control_tables, is_business_context_seeded
 from agents.context.agent import ContextAgent
 from agents.instrumentation.agent import InstrumentationAgent
 from agents.analytics.agent import AnalyticsAgent
@@ -209,11 +209,11 @@ def run_pipeline(spec_dir: str):
             ensure_control_tables(client)
             llm_call_fn = _build_llm_call_fn(or_config)
             ca = ContextAgent(client=client, llm_call_fn=llm_call_fn)
-            if not is_context_layer_seeded(client):
+            if not is_business_context_seeded(client):
                 seeded = ca.load_v1()
-                print(f"  Seeded {seeded} Tier-2 context rows (v1).")
+                print(f"  Seeded business-context document (v{seeded}).")
             else:
-                print("  Context layer already seeded, skipping load_v1().")
+                print("  Business context document already seeded, skipping load_v1().")
         _log("context", "Context Agent done", stage_t0)
 
         # 3. Run InstrumentationAgent

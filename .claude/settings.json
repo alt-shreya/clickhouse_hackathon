@@ -3,7 +3,9 @@
     "allow": [
       "Bash(python -c ' *)",
       "Bash(python -c \"import anthropic; print\\(anthropic.__version__\\)\")",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(python -m pytest -v)",
+      "Bash(git -C /workspaces/clickhouse_hackathon status --short)"
     ]
   }
 }

@@ -2,8 +2,9 @@
 Instrumentation Agent
 Turns feature specs into production-ready ClickHouse schemas.
 Uses ContextAgent for base context, meta_context_registry for existing table metadata,
-and OpenRouter LLM for intelligent schema generation. Integrates with ContextAgent to 
-update Tier 1 and Tier 2 metadata when new schemas are created.
+and OpenRouter/Anthropic LLM for intelligent schema generation. Integrates with
+ContextAgent to auto-document new tables in the business-context document when new
+schemas are created.
 """
 
 from pathlib import Path
@@ -163,14 +164,12 @@ class InstrumentationAgent:
         openrouter_config=None,
         database: str = "atlys",
         registry_table: str = "meta_context_registry",
-        control_db: str = "agent_control",
     ):
         self.client = clickhouse_client
         self.context_agent = context_agent
         self.openrouter_config = openrouter_config
         self.database = database
         self.registry_table = registry_table
-        self.control_db = control_db
         
         # Generated schemas
         self.schemas: Dict[str, TableSchema] = {}
@@ -193,23 +192,18 @@ class InstrumentationAgent:
     # ============================================================
     
     def load_context(self) -> Dict[str, Any]:
-        """Load all context: ContextAgent (Tier 1 + Tier 2) + meta_context_registry + agent_control."""
-        # 1. Merged context from ContextAgent
+        """Load all context: ContextAgent's business-context document + meta_context_registry."""
+        # 1. The latest business-context document from ContextAgent
         if self.context_agent and hasattr(self.context_agent, "get_latest_context"):
             self._context_cache = self.context_agent.get_latest_context()
 
         # 2. Existing tables from registry
         if self.client:
             self._load_registry()
-        
-        # 3. Control flags (if any)
-        if self.client:
-            self._load_control_flags()
-        
+
         return {
             "base_context": self._context_cache,
             "existing_tables": self._existing_tables,
-            "control_flags": self._context_cache.get("control_flags", {}),
         }
     
     def _load_registry(self):
@@ -242,18 +236,6 @@ class InstrumentationAgent:
                 "is_current": row[12],
             }
     
-    def _load_control_flags(self):
-        """Load control flags from agent_control.context_flags."""
-        try:
-            query = f"SELECT flag_name, flag_value, description FROM {self.control_db}.context_flags"
-            result = self.client.query(query)
-            flags = {}
-            for row in result.result_rows:
-                flags[row[0]] = {"value": row[1], "description": row[2]}
-            self._context_cache["control_flags"] = flags
-        except Exception:
-            pass  # Table might be empty or not exist
-    
     def get_existing_table(self, name: str) -> Optional[Dict[str, Any]]:
         """Get existing table metadata by name."""
         return self._existing_tables.get(name)
@@ -265,37 +247,19 @@ class InstrumentationAgent:
     def get_context_summary(self) -> str:
         """Get a text summary of all context for LLM prompts.
 
-        Matches ContextAgent.get_latest_context()'s actual shape: {schema_context:
-        {tables, columns}, business_context: [...], flags: [...], context_version}.
-        A prior version of this method read {entities, metrics, issues} keys that
-        get_latest_context() never returns, so the schema-generation LLM prompt was
-        silently missing all business context (metrics, known issues, join map).
+        ContextAgent.get_latest_context() now returns one whole business-context
+        Markdown document ({doc_id, content, version, changelog_summary,
+        updated_at}) rather than decomposed rows -- see agents/context/agent.py.
+        The document's own content (business overview, metrics, known issues,
+        join map, auto-instrumented tables, open flags) is injected verbatim.
         """
         parts = []
 
-        if self._context_cache:
-            business_context = self._context_cache.get("business_context", [])
-            schema_context = self._context_cache.get("schema_context", {})
-            flags = self._context_cache.get("flags", [])
-
-            if business_context:
-                parts.append(f"=== BUSINESS CONTEXT ({len(business_context)} rows: metrics, known issues, join map) ===")
-                for row in business_context:
-                    parts.append(f"  - [{row.get('value_type', '')}] {row.get('entity', '')}.{row.get('key', '')}: {row.get('value', '')}")
-
-            tables_c = schema_context.get("tables", [])
-            columns_c = schema_context.get("columns", [])
-            if tables_c or columns_c:
-                parts.append("\n=== SCHEMA COMMENTS (native ClickHouse COMMENTs on atlys.*) ===")
-                for t in tables_c:
-                    parts.append(f"  - Table {t.get('entity', '')}: {t.get('comment', '')}")
-                for c in columns_c:
-                    parts.append(f"  - {c.get('entity', '')}.{c.get('column', '')}: {c.get('comment', '')}")
-
-            if flags:
-                parts.append(f"\n=== OPEN CONTEXT FLAGS ({len(flags)}) -- treat with suspicion ===")
-                for f in flags:
-                    parts.append(f"  - [{f.get('flag_type', '')}] {f.get('entity', '')}.{f.get('key', '')}: {f.get('description', '')}")
+        content = (self._context_cache or {}).get("content", "")
+        if content:
+            version = self._context_cache.get("version", "?")
+            parts.append(f"=== BUSINESS CONTEXT (living document, version {version}) ===")
+            parts.append(content)
 
         # Existing tables
         if self._existing_tables:
@@ -1025,7 +989,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         """
         Executes DDL statements to create generated tables in ClickHouse,
         registers them in meta_context_registry, invokes ContextAgent.update_context()
-        to produce Tier 1 native comments and Tier 2 business rules, then creates a
+        to document the new table in the business-context document, then creates a
         daily segment-rollup materialized view on this spec's primary table.
         """
         results = {}

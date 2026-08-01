@@ -1,67 +1,72 @@
 """
-One-time (or on-change) audit pass over agent_control.context_layer.
-Single LLM call. Input is the ~39 already-parsed atomic rows (a few KB of text)
--- never raw event rows. Output is written to agent_control.context_flags.
+Audit checks for the business-context document (analytics_context.business_context).
 
-Token math: 39 short rows * ~40 tokens each ~= 1.5-2K input tokens, one call.
-This is not the thing the "don't burn tokens" warning is about.
+Two independent passes, both feeding ContextAgent.run_audit():
+1. freshness_check() -- deterministic, no LLM. Does every table
+   InstrumentationAgent has ever registered still actually exist? This is the
+   literal "is the business context obsolete" check the document's own
+   Section 9 (Data freshness check) tells the reader to run.
+2. An LLM pass over the full document text, for contradictions/ambiguity/
+   staleness it can support from the text alone (things the deterministic
+   check above can't catch, e.g. two metrics defined two conflicting ways).
 """
 
 import json
 import re
-import clickhouse_connect
 
-AUDIT_PROMPT = """You are auditing a business context layer for an analytics system.
-Below are atomic context rows (entity, key, value, value_type, source_table) for a
-visa-application funnel product. Identify ONLY issues you can support from the text
-itself. For each issue return: flag_type, entity, key, description.
+AUDIT_PROMPT = """You are auditing a business-context Markdown document for an analytics
+system (a visa-application funnel product). Read the document below and identify ONLY
+NEW issues you can support from the text itself -- do not repeat anything already listed
+under "ALREADY-FLAGGED ISSUES" below, even if you would phrase or key it differently:
+- contradiction        (two statements conflict, e.g. the same metric defined two ways)
+- stale_metric         (a definition or fact that reads as outdated or superseded)
+- missing_relationship (a table/column implies a join or entity link never stated)
+- ambiguous_definition (a term used but never concretely defined)
 
-flag_type must be one of:
-- contradiction        (two rows conflict, e.g. same concept defined two ways)
-- stale_metric         (a definition that looks outdated or superseded)
-- missing_relationship (schema/columns imply a join or entity link not stated)
-- ambiguous_definition (a term used but never concretely defined, e.g. an undefined field)
+Respond with ONLY a JSON array of objects with keys: flag_type, entity, key, description.
+entity/key should name the specific table/metric/section the issue is about (e.g.
+entity="metric.conversion_rate", key="session_undefined"). No prose, no markdown fences.
+If there are no NEW issues, respond with an empty JSON array: []
 
-Respond with ONLY a JSON array of objects with keys:
-flag_type, entity, key, description, conflicting_keys (array of "entity.key" strings, may be empty).
-No prose, no markdown fences.
+ALREADY-FLAGGED ISSUES (do not repeat these, in any rephrasing):
+{existing_flags}
 
-CONTEXT ROWS:
-{rows_json}
+DOCUMENT:
+{document}
 """
 
 
-def fetch_current_rows(client):
-    result = client.query("""
-        SELECT entity, key, argMax(value, version) AS value,
-               argMax(value_type, version) AS value_type,
-               argMax(source_table, version) AS source_table
-        FROM agent_control.context_layer
-        GROUP BY entity, key
-        HAVING argMax(change_type, version) != 'deprecation'
-        ORDER BY entity, key
-    """)
-    return [dict(zip(result.column_names, row)) for row in result.result_rows]
+def freshness_check(client) -> list[dict]:
+    """Does every table InstrumentationAgent has registered still actually
+    exist in atlys? A meta_context_registry entry with no matching live table
+    means the business context could be describing something that's gone --
+    exactly the staleness Section 9 of the document asks the reader to verify."""
+    try:
+        registered = client.query(
+            "SELECT DISTINCT entity_name FROM atlys.meta_context_registry "
+            "WHERE is_current = 1 AND entity_type = 'table'"
+        )
+        existing = client.query("SELECT name FROM system.tables WHERE database = 'atlys'")
+    except Exception as e:
+        print(f"Warning: freshness_check could not read schema metadata, skipping: {e}")
+        return []
 
+    registered_names = {r[0] for r in registered.result_rows}
+    existing_names = {r[0] for r in existing.result_rows}
+    missing = registered_names - existing_names
 
-def cross_check_against_schema(client, flags):
-    """Verify any flag claiming a table/column doesn't exist, rather than
-    trusting the LLM's claim. Cheap metadata-only query, no event rows."""
-    existing = client.query("""
-        SELECT table, name FROM system.columns WHERE database = 'atlys'
-    """)
-    existing_pairs = {(r[0], r[1]) for r in existing.result_rows}
-    existing_tables = {t for t, _ in existing_pairs}
-
-    verified = []
-    for f in flags:
-        flag_type = f.get("flag_type", "")
-        entity = f.get("entity", "")
-        
-        if flag_type == "missing_relationship" and entity not in existing_tables:
-            f["description"] = f.get("description", "") + " [UNVERIFIED: referenced table not found in system.columns -- confirm manually]"
-        verified.append(f)
-    return verified
+    return [
+        {
+            "flag_type": "stale_metric",
+            "entity": name,
+            "key": "table_existence",
+            "description": (
+                f"Table `{name}` is registered in meta_context_registry but no longer "
+                f"exists in atlys -- any business context describing it is obsolete."
+            ),
+        }
+        for name in sorted(missing)
+    ]
 
 
 def parse_llm_json(raw_text: str):
@@ -71,67 +76,3 @@ def parse_llm_json(raw_text: str):
     if match:
         return json.loads(match.group(1))
     return json.loads(cleaned)
-
-
-
-def run_audit(client, llm_call_fn):
-    rows = fetch_current_rows(client)
-    if not rows:
-        print("No active context rows found to audit.")
-        return []
-
-    prompt = AUDIT_PROMPT.format(rows_json=json.dumps(rows, indent=2, default=str))
-
-    # Pass span_name if llm_call_fn supports it for Langfuse tracking
-    try:
-        raw_response = llm_call_fn(prompt, span_name="context_audit")
-    except TypeError:
-        raw_response = llm_call_fn(prompt)
-
-    # Use robust JSON extraction helper
-    flags = parse_llm_json(raw_response)
-    
-    if not isinstance(flags, list):
-        print(f"Warning: Expected JSON list from LLM, got {type(flags)}. Normalizing...")
-        flags = [flags] if isinstance(flags, dict) else []
-
-    flags = cross_check_against_schema(client, flags)
-
-    insert_rows = []
-    for f in flags:
-        insert_rows.append([
-            f.get("entity", ""),
-            f.get("key", ""),
-            f.get("flag_type", "ambiguous_definition"),
-            f.get("description", ""),
-            f.get("conflicting_keys", []),  # Populates conflicting_versions/keys if provided
-            "open",
-        ])
-
-    if insert_rows:
-        client.insert(
-            "agent_control.context_flags",
-            insert_rows,
-            column_names=["entity", "key", "flag_type", "description", "conflicting_versions", "status"],
-        )
-    
-    print(f"Audit complete: {len(flags)} flags written to agent_control.context_flags.")
-    return flags
-
-
-if __name__ == "__main__":
-    # Test client connection wrapper
-    client = clickhouse_connect.get_client(
-        host="<your-service-host>", 
-        username="<user>", 
-        password="<password>", 
-        database="atlys"
-    )
-
-    def llm_call_fn(prompt: str, span_name: str = "context_audit") -> str:
-        # Mock wrapper: Replace this with your actual Anthropic call + Langfuse span
-        raise NotImplementedError("Wire this function to your LLM completion provider.")
-
-    run_audit(client, llm_call_fn)
-
-
