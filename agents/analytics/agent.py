@@ -27,41 +27,62 @@ class Insight:
 
 class AnalyticsAgent:
     """Agent that analyzes data and produces actionable insights."""
-    
+
+    CORE_FUNNEL_STEPS = ["destination_card_clicked", "application_started", "document_uploaded", "purchase_completed"]
+
     def __init__(self, client, database: str, context_agent=None, openrouter_config=None):
         self.client = client
         self.database = database
         self.context_agent = context_agent
         self.insights: List[Insight] = []
-        
+
         self.openrouter_config = openrouter_config
         self._llm_client = None
         if openrouter_config and openrouter_config.enabled:
             self._llm_client = openrouter_config.get_client()
-    
+
     def run_query(self, query: str) -> List[Dict]:
         """Execute a query and return results as list of dicts."""
         result = self.client.query(query)
         columns = result.column_names
         return [dict(zip(columns, row)) for row in result.result_rows]
-    
+
+    def sequential_funnel(self, steps: List[str], id_column: str = "user_id", window_days: int = 30) -> Dict[str, int]:
+        """Count users reaching each step of `steps`, IN ORDER, within a
+        `window_days` window -- via ClickHouse's windowFunnel(), per
+        base_context.md §7's explicit guidance ("Prefer windowFunnel/
+        sequenceMatch over per-table row dumps"). A prior version counted
+        count(DISTINCT user_id) independently per table with no ordering/join
+        constraint at all, which isn't a funnel -- it doesn't verify a user who
+        appears in step N+1 ever passed through step N.
+        """
+        if not steps:
+            return {}
+        union_sql = "\nUNION ALL\n".join(
+            f"SELECT {id_column}, timestamp, '{t}' AS step FROM {self.database}.{t}"
+            for t in steps
+        )
+        conds = ", ".join(f"step = '{t}'" for t in steps)
+        level_counts = ", ".join(f"countIf(level >= {i + 1}) AS step_{i + 1}" for i in range(len(steps)))
+        query = f"""
+        SELECT {level_counts}
+        FROM (
+            SELECT {id_column}, windowFunnel({window_days * 86400})(timestamp, {conds}) AS level
+            FROM ( {union_sql} )
+            GROUP BY {id_column}
+        )
+        """
+        result = self.client.query(query)
+        row = result.result_rows[0] if result.result_rows else [0] * len(steps)
+        return dict(zip(steps, row))
+
     def get_funnel_metrics(self) -> Dict[str, Any]:
-        """Compute conversion funnel metrics."""
-        # Funnel: destination_card_clicked -> application_started -> document_uploaded -> purchase_completed
-        queries = {
-            "destination_card_clicked": f"SELECT count(DISTINCT user_id) FROM {self.database}.destination_card_clicked",
-            "application_started": f"SELECT count(DISTINCT user_id) FROM {self.database}.application_started",
-            "document_uploaded": f"SELECT count(DISTINCT user_id) FROM {self.database}.document_uploaded",
-            "purchase_completed": f"SELECT count(DISTINCT user_id) FROM {self.database}.purchase_completed",
-        }
-        results = {}
-        for step, query in queries.items():
-            results[step] = self.client.command(query)
-        return results
-    
-    def get_drop_off_rates(self) -> Dict[str, float]:
+        """Sequential funnel over the 4 core pre-purchase steps."""
+        return self.sequential_funnel(self.CORE_FUNNEL_STEPS)
+
+    def get_drop_off_rates(self, funnel: Optional[Dict[str, int]] = None) -> Dict[str, float]:
         """Calculate drop-off rates between funnel steps."""
-        funnel = self.get_funnel_metrics()
+        funnel = funnel if funnel is not None else self.get_funnel_metrics()
         rates = {}
         steps = list(funnel.keys())
         for i in range(len(steps) - 1):
@@ -130,21 +151,33 @@ class AnalyticsAgent:
         self.insights.append(insight)
         return insight
     
-    def generate_narrative_insights(self, query_results: Dict[str, Any], context: str) -> List[Insight]:
+    def generate_narrative_insights(
+        self, query_results: Dict[str, Any], context: str, pm_questions: Optional[List[str]] = None
+    ) -> List[Insight]:
         """Use LLM to generate narrative insights from query results."""
         if not self._llm_client:
             print("No LLM client configured, falling back to basic insights")
             return []
-            
+
+        questions_block = ""
+        if pm_questions:
+            bullet_list = "\n".join(f"- {q}" for q in pm_questions)
+            questions_block = f"""
+        This feature's spec lists these specific questions a PM will ask. Prioritize
+        insights that directly answer them over generic funnel commentary -- if the
+        query results don't support answering one, say so rather than skipping it silently:
+        {bullet_list}
+        """
+
         prompt = f"""
         Analyze the following query results and context to generate actionable product insights.
-        
+        {questions_block}
         Context:
         {context}
-        
+
         Query Results:
         {json.dumps(query_results, indent=2, default=str)}
-        
+
         Output JSON format:
         {{
             "insights": [
@@ -203,13 +236,56 @@ class AnalyticsAgent:
                 print(f"Failed to generate narrative insights: {e}")
                 return []
 
-    def run_full_analysis(self) -> List[Insight]:
-        """Run complete analysis pipeline."""
-        with get_tracer().trace_span("analytics.run_full_analysis"):
-            # Funnel analysis
+    def analyze_spec_tables(self, table_names: List[str]) -> Dict[str, Any]:
+        """Analyze the tables InstrumentationAgent just created for the current
+        spec: a sequential funnel over them (in the order given, which follows
+        the spec's own event sequence) plus per-table segment breakdowns. This
+        is what makes a spec's insights about *that* feature, rather than only
+        ever repeating the 4 core funnel tables' generic numbers regardless of
+        which spec is running.
+        """
+        if not table_names:
+            return {}
+
+        funnel: Dict[str, int] = {}
+        drop_offs: Dict[str, float] = {}
+        if len(table_names) > 1:
+            try:
+                funnel = self.sequential_funnel(table_names)
+                drop_offs = self.get_drop_off_rates(funnel)
+            except Exception as e:
+                print(f"Spec funnel query failed: {e}")
+
+        segments: Dict[str, List[Dict]] = {}
+        for table in table_names:
+            for segment in ("device_type", "geoip_country_code"):
+                try:
+                    rows = self.analyze_by_segment(segment, table)
+                    if rows:
+                        segments[f"{table}_{segment}"] = rows
+                except Exception:
+                    pass
+
+        return {"tables": table_names, "funnel": funnel, "drop_offs": drop_offs, "segments": segments}
+
+    def run_full_analysis(
+        self,
+        spec_tables: Optional[List[str]] = None,
+        pm_questions: Optional[List[str]] = None,
+        spec_name: str = "",
+    ) -> List[Insight]:
+        """Run the complete analysis pipeline: the 4 core pre-purchase funnel
+        tables (always-relevant background) plus, when given, the current
+        spec's own newly-instrumented tables and its "Questions the PM will
+        ask". A prior version only ever analyzed the 4 core tables -- every
+        spec produced the same generic funnel commentary and never actually
+        answered that spec's own PM questions.
+        """
+        with get_tracer().trace_span("analytics.run_full_analysis", metadata={"spec_name": spec_name}):
+            # Core pre-purchase funnel
             funnel = self.get_funnel_metrics()
-            drop_offs = self.get_drop_off_rates()
-            
+            drop_offs = self.get_drop_off_rates(funnel)
+
             self.generate_insight(
                 title="Conversion Funnel Overview",
                 description=f"Funnel metrics: {json.dumps(funnel)}",
@@ -218,7 +294,7 @@ class AnalyticsAgent:
                 severity="info",
                 tags=["funnel", "overview"]
             )
-            
+
             for step, rate in drop_offs.items():
                 severity = "warning" if rate > 50 else "info"
                 self.generate_insight(
@@ -229,9 +305,8 @@ class AnalyticsAgent:
                     severity=severity,
                     tags=["funnel", "drop_off"]
                 )
-            
+
             segments_data = {}
-            # Segment analysis
             for table in ["destination_card_clicked", "application_started", "purchase_completed"]:
                 for segment in ["device_type", "geoip_country_code", "funnel_type"]:
                     try:
@@ -249,20 +324,48 @@ class AnalyticsAgent:
                             )
                     except Exception:
                         pass
-            
+
+            # The current spec's own tables -- what makes this run's insights
+            # specific to the feature being analyzed.
+            spec_analysis: Dict[str, Any] = {}
+            if spec_tables:
+                spec_analysis = self.analyze_spec_tables(spec_tables)
+                if spec_analysis.get("funnel"):
+                    self.generate_insight(
+                        title=f"{spec_name or 'Feature'} funnel",
+                        description=f"Sequential funnel over {', '.join(spec_tables)}: {json.dumps(spec_analysis['funnel'])}",
+                        metric="spec_funnel_users",
+                        value=spec_analysis["funnel"],
+                        severity="info",
+                        tags=["funnel", "spec", spec_name] if spec_name else ["funnel", "spec"],
+                    )
+                for step, rate in spec_analysis.get("drop_offs", {}).items():
+                    severity = "warning" if rate > 50 else "info"
+                    self.generate_insight(
+                        title=f"{spec_name or 'Feature'} drop-off: {step}",
+                        description=f"{rate:.1f}% of users drop off at this step",
+                        metric="spec_drop_off_rate",
+                        value=rate,
+                        severity=severity,
+                        tags=["funnel", "drop_off", "spec", spec_name] if spec_name else ["funnel", "drop_off", "spec"],
+                    )
+
             # Now generate narrative insights using LLM
             query_results = {
-                "funnel": funnel,
-                "drop_offs": drop_offs,
-                "segments": segments_data
+                "core_funnel": funnel,
+                "core_drop_offs": drop_offs,
+                "core_segments": segments_data,
+                "spec_analysis": spec_analysis,
             }
-            
+
             context_summary = "No context available"
             if self.context_agent:
-                context_summary = "Context loaded from ContextAgent."
-            
-            self.generate_narrative_insights(query_results, context_summary)
-            
+                entities_in_scope = list(self.CORE_FUNNEL_STEPS) + list(spec_tables or [])
+                latest_context = self.context_agent.get_latest_context(entities=entities_in_scope)
+                context_summary = f"Context from ContextAgent:\n{json.dumps(latest_context, indent=2, default=str)}"
+
+            self.generate_narrative_insights(query_results, context_summary, pm_questions=pm_questions)
+
             return self.insights
     
     def export_insights(self, output_path: Path, format: str = "json"):

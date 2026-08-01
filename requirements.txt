@@ -1,6 +1,7 @@
-# Anthropic SDK -- for llm_call_fn (context_audit / context_update calls, and later
-# the Instrumentation/Analytics agents' LLM calls)
-anthropic>=0.39.0
+# All three agents (Context/Instrumentation/Analytics) share one LLM provider:
+# OpenRouter, via the `openai` package below (OpenAI-compatible endpoint). See
+# agents/config.py:make_llm_call_fn(). The `anthropic` package is not used --
+# ANTHROPIC_API_KEY in .env is currently inert; set OPENROUTER_API_KEY instead.
 
 # Langfuse -- required by the problem statement for tracing every LLM call and SQL span
 langfuse>=2.53.0

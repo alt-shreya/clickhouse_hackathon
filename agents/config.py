@@ -72,14 +72,14 @@ class OpenRouterConfig:
     @classmethod
     def from_env(cls) -> "OpenRouterConfig":
         """Load config from environment variables."""
-        api_key = os.getenv("OPENROUTER_API_KEY", " ")
+        api_key = os.getenv("OPENROUTER_API_KEY", "")
         return cls(
             api_key=api_key,
-            model=os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+            model=os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free"),
             base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
             enabled=bool(api_key),
         )
-    
+
     def get_client(self):
         """Get an OpenAI-compatible client for OpenRouter."""
         if not self.enabled:
@@ -94,6 +94,41 @@ class OpenRouterConfig:
             )
         except ImportError:
             raise ImportError("openai package required: pip install openai")
+
+
+def make_llm_call_fn(openrouter_config: "OpenRouterConfig"):
+    """
+    Build a (prompt, span_name) -> str callable backed by OpenRouter, matching the
+    contract ContextAgent (and audit_base_context.run_audit) expect. Traces every
+    call through the shared TracingAgent so context-audit/update/resolve calls show
+    up in Langfuse alongside the Instrumentation/Analytics LLM calls.
+    """
+    if not openrouter_config or not openrouter_config.enabled:
+        raise ValueError("OpenRouter not configured (missing OPENROUTER_API_KEY)")
+
+    client = openrouter_config.get_client()
+
+    def llm_call_fn(prompt: str, span_name: str = "context_llm_call") -> str:
+        from agents.tracing.agent import get_tracer
+
+        tracer = get_tracer()
+        with tracer.trace_span(span_name, input_data={"prompt": prompt[:2000]}):
+            response = client.chat.completions.create(
+                model=openrouter_config.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            completion = (response.choices[0].message.content or "").strip()
+            tracer.log_generation(
+                name=span_name,
+                model=openrouter_config.model,
+                prompt=prompt,
+                completion=completion,
+            )
+            return completion
+
+    return llm_call_fn
 
 
 def load_dotenv(env_path: Optional[Path] = None) -> bool:

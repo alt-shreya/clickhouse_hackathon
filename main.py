@@ -1,7 +1,11 @@
 import argparse
+import re
+import uuid
+from datetime import datetime
 from pathlib import Path
 import clickhouse_connect
-from agents.config import get_config
+from agents.config import get_config, make_llm_call_fn
+from agents.setup import ensure_control_tables, is_context_layer_seeded
 from agents.context.agent import ContextAgent
 from agents.instrumentation.agent import InstrumentationAgent
 from agents.analytics.agent import AnalyticsAgent
@@ -10,6 +14,27 @@ from agents.visualization.dashboard_builder import DashboardBuilder
 import dataclasses
 import json
 from collections import defaultdict
+
+
+def _build_llm_call_fn(or_config):
+    """Adapt OpenRouterConfig into the (prompt, span_name) -> str callable
+    ContextAgent expects. Degrades gracefully (matching the fallback pattern
+    already used by InstrumentationAgent/AnalyticsAgent) if no OPENROUTER_API_KEY
+    is configured, so the pipeline still runs -- just without context
+    audit/enrichment -- rather than crashing on the first ContextAgent call."""
+    if or_config and or_config.enabled:
+        return make_llm_call_fn(or_config)
+
+    print("Warning: OPENROUTER_API_KEY not set -- ContextAgent will run without LLM audit/enrichment.")
+
+    def _noop_llm_call_fn(prompt: str, span_name: str = "context_llm_call") -> str:
+        if span_name == "context_audit":
+            return "[]"
+        if span_name == "context_resolve":
+            return json.dumps({"resolved_value": "", "resolution_notes": "LLM not configured"})
+        return json.dumps({"schema_comments": {}, "business_rules": []})
+
+    return _noop_llm_call_fn
 
 
 def _extract_scalar(value):
@@ -23,10 +48,46 @@ def _extract_scalar(value):
     return value
 
 
+def _parse_timestamp(value):
+    """events.ndjson carries timestamp as an ISO-ish string
+    ("2026-06-08T06:00:00.000"); clickhouse_connect's DateTime writer needs an
+    actual datetime object (it calls .timestamp() on each value client-side),
+    so passing the raw string through failed every single row insert."""
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _parse_event_id(value):
+    """The `id` column is UUID; known specs' raw ids are 32-char lowercase hex
+    (no dashes), which clickhouse_connect parses fine, but a single
+    non-hex/malformed id in a batch throws client-side and fails the WHOLE
+    table's insert, not just that row -- a real risk for an unseen spec's data
+    (base_context.md repeatedly flags "known texture": nulls, backfills,
+    dupes). Fall back to a freshly generated UUID rather than lose the batch;
+    log so it's traceable, not silent."""
+    if isinstance(value, str):
+        try:
+            return str(uuid.UUID(value))
+        except ValueError:
+            print(f"  Warning: event id '{value}' isn't a valid UUID/hex string, substituting a generated one")
+            return str(uuid.uuid4())
+    return value
+
+
 def _flatten_event_row(row: dict) -> dict:
     flattened = {}
     for key, value in row.items():
         if key == "event":
+            continue
+        if key == "timestamp":
+            flattened[key] = _parse_timestamp(value)
+            continue
+        if key == "id":
+            flattened[key] = _parse_event_id(value)
             continue
         if isinstance(value, dict):
             for sub_key, sub_value in value.items():
@@ -63,6 +124,16 @@ def _event_to_table(row: dict) -> str | None:
     return mapping.get(event_name, event_name)
 
 
+def _extract_pm_questions(spec_md: str) -> list:
+    """Pull the "## Questions the PM will ask" bullet list out of a spec.md, so
+    AnalyticsAgent can be prompted to answer this spec's actual questions
+    instead of only producing generic funnel commentary."""
+    match = re.search(r"^##\s*Questions the PM will ask\s*\n(.*?)(?=\n##|\Z)", spec_md, re.MULTILINE | re.DOTALL)
+    if not match:
+        return []
+    return [line.lstrip("- ").strip() for line in match.group(1).splitlines() if line.strip().startswith("-")]
+
+
 def _resolve_path(base: Path, *parts: str) -> Path:
     candidate = base.joinpath(*parts)
     if candidate.exists():
@@ -94,22 +165,21 @@ def run_pipeline(spec_dir: str):
                 port=ch_config.port,
                 username=ch_config.user,
                 password=ch_config.password,
-                secure=ch_config.secure
+                secure=ch_config.secure,
+                database=ch_config.database,
             )
 
         # 2. Run ContextAgent
         print("Running Context Agent...")
         with tracer.trace_span("pipeline.context"):
-            ca = ContextAgent(str(_resolve_path(repo_root, "base_context.md")), clickhouse_client=client)
-            try:
-                ca.load_context()
-            except FileNotFoundError:
-                print("base_context.md not found, attempting fallback...")
-                ca.context_path = 'base_context.md'
-                try:
-                    ca.load_context()
-                except Exception as e:
-                    print(f"Warning: Context load failed: {e}")
+            ensure_control_tables(client)
+            llm_call_fn = _build_llm_call_fn(or_config)
+            ca = ContextAgent(client=client, llm_call_fn=llm_call_fn)
+            if not is_context_layer_seeded(client):
+                seeded = ca.load_v1()
+                print(f"  Seeded {seeded} Tier-2 context rows (v1).")
+            else:
+                print("  Context layer already seeded, skipping load_v1().")
 
         # 3. Run InstrumentationAgent
         print("Running Instrumentation Agent...")
@@ -121,22 +191,19 @@ def run_pipeline(spec_dir: str):
                 openrouter_config=or_config,
                 database=ch_config.database
             )
+            # process_spec() already executes the generated DDL, registers each
+            # table, updates context, and creates the rollup MV (execute_ddl=True
+            # by default) -- emit_ddl() below is just the written record, not a
+            # second execution pass. A prior version of this function re-parsed
+            # and re-ran emit_ddl()'s output here, which just re-issued every
+            # CREATE TABLE/VIEW a second time and errored on "already exists".
             schemas = ia.process_spec(spec_path)
-            print("  Emitting DDL...")
+            print("  Emitting DDL record...")
             ddl_out = ia.emit_ddl()
             out_file = spec_path / "generated_schema.sql"
             out_file.write_text(ddl_out)
-            
-            print("Executing DDL in ClickHouse...")
-            for statement in ddl_out.split(';'):
-                stmt = statement.strip()
-                if stmt:
-                    try:
-                        client.command(stmt)
-                    except Exception as e:
-                        print(f"Failed to execute statement: {e}\nStatement: {stmt[:100]}...")
-            
-            print(f"Saved and executed {len(schemas)} schemas.")
+
+            print(f"Created and registered {len(schemas)} schemas ({len(ia.materialized_views)} materialized view(s)).")
             
             # Load Data
             events_file = spec_path / "events.ndjson"
@@ -174,7 +241,7 @@ def run_pipeline(spec_dir: str):
                         data_tuples.append(tuple(r.get(col) for col in column_names))
 
                     try:
-                        client.insert(table, data_tuples, column_names=column_names)
+                        client.insert(f"{ch_config.database}.{table}", data_tuples, column_names=column_names)
                         print(f"  Inserted {len(rows)} rows into {table}")
                     except Exception as e:
                         print(f"  Warning: failed to insert data into {table}: {e}")
@@ -193,12 +260,15 @@ def run_pipeline(spec_dir: str):
                 context_agent=ca,
                 openrouter_config=or_config
             )
-            insights = aa.run_full_analysis()
+            spec_tables = list(ia.schemas.keys())
+            spec_name = ia.last_analysis.feature_name if ia.last_analysis else spec_path.name
+            pm_questions = _extract_pm_questions(ia.last_analysis.raw_spec_md) if ia.last_analysis else []
+            insights = aa.run_full_analysis(spec_tables=spec_tables, pm_questions=pm_questions, spec_name=spec_name)
             md_out = spec_path / "insight_summary.md"
             aa.export_insights(md_out, format="markdown")
             print(f"Saved {len(insights)} insights to {md_out}")
 
-        # 5. Run VisualizationAgent (Dashboard Builder)
+        # 5. Build the dashboard
         print("Building Dashboard UI...")
         with tracer.trace_span("pipeline.visualization"):
             insights_dicts = [dataclasses.asdict(i) for i in insights]

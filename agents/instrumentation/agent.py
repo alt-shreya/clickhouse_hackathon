@@ -80,13 +80,24 @@ class TableSchema:
         ddl += f"ENGINE = {self.engine}"
         if self.partition_by:
             ddl += f"\nPARTITION BY {self.partition_by}"
+
+        settings = dict(self.settings)
         if self.order_by:
             order_expr = self.order_by
             if not order_expr.startswith("("):
                 order_expr = f"({order_expr})"
             ddl += f"\nORDER BY {order_expr}"
-        if self.settings:
-            settings_str = ", ".join(f"{k}={v}" for k, v in self.settings.items())
+            # ClickHouse rejects Nullable columns in the sort key unless this is
+            # set. We deliberately keep envelope columns like application_id
+            # Nullable (real edge cases can exist even when a spec's own sample
+            # never shows one) and still key on them when they're the best
+            # available identifier -- so set the flag rather than forcing the
+            # column non-null.
+            nullable_cols = {c.name for c in self.columns if c.nullable}
+            if any(col in order_expr for col in nullable_cols):
+                settings.setdefault("allow_nullable_key", 1)
+        if settings:
+            settings_str = ", ".join(f"{k}={v}" for k, v in settings.items())
             ddl += f"\nSETTINGS {settings_str}"
         ddl += ";"
         if self.description:
@@ -140,7 +151,11 @@ class InstrumentationAgent:
         
         # Generated schemas
         self.schemas: Dict[str, TableSchema] = {}
-        
+        # name -> DDL, for the daily segment-rollup MVs execute_and_update_context() creates
+        self.materialized_views: Dict[str, str] = {}
+        # Most recent parse_spec() result, kept for callers that want feature_name/raw_spec_md after process_spec()
+        self.last_analysis: Optional[SpecAnalysis] = None
+
         # Cached context
         self._existing_tables: Dict[str, Any] = {}
         self._context_cache: Dict[str, Any] = {}
@@ -155,15 +170,11 @@ class InstrumentationAgent:
     # ============================================================
     
     def load_context(self) -> Dict[str, Any]:
-        """Load all context: base_context.md + meta_context_registry + agent_control."""
-        # 1. Base context from markdown or ContextAgent
-        if self.context_agent:
-            if hasattr(self.context_agent, "get_latest_context"):
-                self._context_cache = self.context_agent.get_latest_context()
-            elif hasattr(self.context_agent, "load_context"):
-                self.context_agent.load_context()
-                self._context_cache = self.context_agent.get_context_for_agent("instrumentation")
-        
+        """Load all context: ContextAgent (Tier 1 + Tier 2) + meta_context_registry + agent_control."""
+        # 1. Merged context from ContextAgent
+        if self.context_agent and hasattr(self.context_agent, "get_latest_context"):
+            self._context_cache = self.context_agent.get_latest_context()
+
         # 2. Existing tables from registry
         if self.client:
             self._load_registry()
@@ -229,32 +240,40 @@ class InstrumentationAgent:
         return self._existing_tables
     
     def get_context_summary(self) -> str:
-        """Get a text summary of all context for LLM prompts."""
+        """Get a text summary of all context for LLM prompts.
+
+        Matches ContextAgent.get_latest_context()'s actual shape: {schema_context:
+        {tables, columns}, business_context: [...], flags: [...], context_version}.
+        A prior version of this method read {entities, metrics, issues} keys that
+        get_latest_context() never returns, so the schema-generation LLM prompt was
+        silently missing all business context (metrics, known issues, join map).
+        """
         parts = []
-        
-        # Base context
+
         if self._context_cache:
-            entities = self._context_cache.get("entities", {})
-            metrics = self._context_cache.get("metrics", {})
-            issues = self._context_cache.get("issues", [])
-            
-            parts.append("=== BASE CONTEXT ===")
-            parts.append(f"Entities ({len(entities)}):")
-            for name, e in entities.items():
-                parts.append(f"  - {name}: {e.get('description', '')[:100]}")
-                if e.get("tables"):
-                    parts.append(f"    Tables: {', '.join(e['tables'])}")
-                if e.get("key_columns"):
-                    parts.append(f"    Key columns: {', '.join(e['key_columns'])}")
-            
-            parts.append(f"\nMetrics ({len(metrics)}):")
-            for name, m in metrics.items():
-                parts.append(f"  - {name}: {m.get('formula', '')[:100]}")
-            
-            parts.append(f"\nKnown Issues ({len(issues)}):")
-            for issue in issues:
-                parts.append(f"  - {issue.get('id', '')}: {issue.get('description', '')[:100]}")
-        
+            business_context = self._context_cache.get("business_context", [])
+            schema_context = self._context_cache.get("schema_context", {})
+            flags = self._context_cache.get("flags", [])
+
+            if business_context:
+                parts.append(f"=== BUSINESS CONTEXT ({len(business_context)} rows: metrics, known issues, join map) ===")
+                for row in business_context:
+                    parts.append(f"  - [{row.get('value_type', '')}] {row.get('entity', '')}.{row.get('key', '')}: {row.get('value', '')}")
+
+            tables_c = schema_context.get("tables", [])
+            columns_c = schema_context.get("columns", [])
+            if tables_c or columns_c:
+                parts.append("\n=== SCHEMA COMMENTS (native ClickHouse COMMENTs on atlys.*) ===")
+                for t in tables_c:
+                    parts.append(f"  - Table {t.get('entity', '')}: {t.get('comment', '')}")
+                for c in columns_c:
+                    parts.append(f"  - {c.get('entity', '')}.{c.get('column', '')}: {c.get('comment', '')}")
+
+            if flags:
+                parts.append(f"\n=== OPEN CONTEXT FLAGS ({len(flags)}) -- treat with suspicion ===")
+                for f in flags:
+                    parts.append(f"  - [{f.get('flag_type', '')}] {f.get('entity', '')}.{f.get('key', '')}: {f.get('description', '')}")
+
         # Existing tables
         if self._existing_tables:
             parts.append("\n=== EXISTING TABLES (from meta_context_registry) ===")
@@ -267,9 +286,8 @@ class InstrumentationAgent:
                 parts.append(f"  Tags: {', '.join(t['tags'])}")
                 parts.append("  Columns:")
                 for col in t["columns"]:
-                    nullable = " nullable" if col.get("name", "").endswith("_id") else ""
-                    parts.append(f"    - {col['name']}: {col['type']}{nullable} — {col.get('description', '')}")
-        
+                    parts.append(f"    - {col['name']}: {col['type']} — {col.get('description', '')}")
+
         return "\n".join(parts)
     
     # ============================================================
@@ -287,19 +305,29 @@ class InstrumentationAgent:
             if spec_file.exists():
                 spec_md = spec_file.read_text()
             
-            # Read events.ndjson (sample first 10)
+            # Sample events.ndjson stratified by event type (a flat "first N lines"
+            # cap can miss event types entirely on specs where events aren't
+            # evenly interleaved -- e.g. 02_group_family's first 10 lines are only
+            # group_started/traveller_added, missing traveller_removed and
+            # group_submitted -- which would then get no schema/columns at all).
             events_sample = []
             if events_file.exists():
+                per_type_cap = 5
+                by_type: Dict[str, List[Dict]] = {}
                 with open(events_file) as f:
-                    for i, line in enumerate(f):
-                        if i >= 10:
-                            break
+                    for line in f:
                         line = line.strip()
-                        if line:
-                            try:
-                                events_sample.append(json.loads(line))
-                            except json.JSONDecodeError:
-                                pass
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        bucket = by_type.setdefault(event.get("event", ""), [])
+                        if len(bucket) < per_type_cap:
+                            bucket.append(event)
+                for bucket in by_type.values():
+                    events_sample.extend(bucket)
             
             # Extract key info from spec.md using LLM
             analysis = self._analyze_with_llm(spec_md, events_sample)
@@ -392,7 +420,7 @@ Focus on:
 === FEATURE SPEC ===
 {spec_md}
 
-=== EVENTS SAMPLE (first 10) ===
+=== EVENTS SAMPLE (stratified, up to 5 per event type) ===
 {events_json}
 
 Extract all entities, events, properties, and relationships. Suggest new table designs that follow Atlys patterns."""
@@ -404,18 +432,23 @@ Extract all entities, events, properties, and relationships. Suggest new table d
         if match:
             feature_name = match.group(1).lower().replace(" ", "-").replace("_", "-")
         
-        event_names = []
-        event_matches = re.findall(r"`(\w+_+\w+)`", spec_md)
-        for m in event_matches:
-            if m not in ["device_type", "geoip_country_code", "app_version", "user_id", "application_id", 
-                         "saved_method_type", "otp_attempts", "otp_success", "shown_amount", "latency_ms"]:
+        # events.ndjson is authoritative when present.
+        event_names = [e["event"] for e in events_sample if "event" in e]
+
+        # Regex fallback from spec.md, for events the (possibly partial) raw
+        # sample doesn't cover. Anchored to the leading backtick token of a
+        # markdown bullet ("- `event_name` — ..."), matching this repo's spec.md
+        # convention -- a prior, unanchored `` `(\w+_+\w+)` `` regex matched ANY
+        # backtick-wrapped identifier anywhere in the doc, including property
+        # names mentioned parenthetically (`group_id`, `traveller_index`, etc.),
+        # which generated bogus near-empty tables for those properties.
+        for m in re.findall(r"^-\s*`(\w+)`", spec_md, re.MULTILINE):
+            if m not in event_names:
                 event_names.append(m)
-        event_matches2 = re.findall(r'event["\s:]+(\w+_+\w+)', spec_md, re.IGNORECASE)
-        event_names.extend(event_matches2)
-        for e in events_sample:
-            if "event" in e:
-                event_names.append(e["event"])
-        
+        for m in re.findall(r'event["\s:]+(\w+_+\w+)', spec_md, re.IGNORECASE):
+            if m not in event_names:
+                event_names.append(m)
+
         event_names = list(dict.fromkeys(event_names))
         
         entities = []
@@ -521,7 +554,7 @@ Return JSON with:
   - description: one-line purpose
   - columns: list of {name, type, description, nullable, low_cardinality, codec}
   - partition_by: partition expression (e.g., "toYYYYMM(timestamp)")
-  - order_by: ordering key (e.g., "id, timestamp, user_id")
+  - order_by: ordering key (e.g., "user_id, timestamp" or "application_id, timestamp")
   - engine: "MergeTree" (default)
   - settings: dict of engine settings
   - related_tables: list of related table names
@@ -530,9 +563,22 @@ Return JSON with:
 Atlys conventions:
 - All event tables have envelope: id UUID, timestamp DateTime, user_id String, application_id Nullable(String)
 - Partition by toYYYYMM(timestamp)
-- Order by (id, timestamp, user_id) for event tables
+- Order by the column queries will actually filter/join on, followed by timestamp --
+  NEVER lead with `id` (a random UUID). The existing 8 production tables all use
+  `ORDER BY (id, timestamp, user_id)`, a known anti-pattern carried over from a
+  legacy template: queries never filter by `id`, so it buys no data skipping and
+  just adds sort cost. Do not repeat it. Prefer `(application_id, timestamp)` when
+  the event always carries an application_id (i.e. it happens after
+  application_started), otherwise `(user_id, timestamp)`. Some events don't
+  reliably carry a user_id either -- e.g. a recipient-side event fired before
+  the recipient has signed up. Check the raw samples: if a field isn't present
+  on every sample, mark that column Nullable and don't force it into the sort
+  key just because it's normally there; key on whatever per-entity id the
+  events actually carry instead (e.g. share_id, group_id), or timestamp alone.
 - Use LowCardinality for enum-like strings (device_type, visa_type, etc.)
-- Use Nullable for optional fields
+- Use Nullable for any field not present on every raw sample -- don't assume
+  the standard envelope (user_id, device_type, etc.) applies uniformly just
+  because it does on the 8 existing tables; check this spec's actual samples
 - Funnel tables: destination_card_clicked -> application_started -> document_uploaded -> purchase_completed
 - Supporting tables: search, scroll, auth, pay_now clicks
 - Reuse existing column names and types where possible"""
@@ -559,8 +605,8 @@ Properties:
 Relationships:
 {json.dumps(analysis.relationships, indent=2)}
 
-Raw Events Sample:
-{json.dumps(analysis.raw_events_sample[:3], indent=2, default=str)}
+Raw Events Sample (one representative per event type):
+{json.dumps(list({e.get("event", i): e for i, e in enumerate(analysis.raw_events_sample)}.values()), indent=2, default=str)}
 
 Generate schemas for any NEW tables needed. Also suggest modifications to existing tables if the spec requires it.
 Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integration with existing funnel."""
@@ -596,6 +642,33 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         
         return schemas
     
+    def _relevant_samples(self, table_name: str, analysis: SpecAnalysis) -> List[Dict]:
+        """Raw event samples belonging to this table's event, keyed by event name."""
+        return [
+            e for e in analysis.raw_events_sample
+            if str(e.get("event", "")).lower().replace(" ", "_").replace("-", "_") == table_name
+        ]
+
+    def _pick_order_by(self, table_name: str, analysis: SpecAnalysis) -> str:
+        """Pick an ordering key from what the event's raw samples actually carry.
+
+        Never leads with `id` (a random UUID) -- the 8 existing production tables
+        all use `ORDER BY (id, timestamp, user_id)`, which EXECUTION_PLAN.md itself
+        flags as a legacy anti-pattern since no query filters by `id`. Key on
+        application_id when the event always carries one (i.e. it fires after
+        application_started), then user_id when that's reliably present, and
+        only fall back to timestamp-only when neither is -- a mostly-NULL
+        leading sort column (e.g. user_id on recipient-side events that fire
+        before the recipient exists, see _build_basic_columns) buys no data
+        skipping either.
+        """
+        samples = self._relevant_samples(table_name, analysis)
+        if samples and all(e.get("application_id") for e in samples):
+            return "(application_id, timestamp)"
+        if samples and all(e.get("user_id") for e in samples):
+            return "(user_id, timestamp)"
+        return "(timestamp)" if samples else "(user_id, timestamp)"
+
     def _basic_generate(self, analysis: SpecAnalysis) -> List[TableSchema]:
         schemas = []
         if not analysis.suggested_tables and analysis.events:
@@ -607,14 +680,14 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
                         "kind": "supporting",
                         "description": event.get("description", ""),
                     })
-        
+
         for st in analysis.suggested_tables:
             columns = self._build_basic_columns(st, analysis)
             schema = TableSchema(
                 name=st["name"],
                 columns=columns,
                 partition_by="toYYYYMM(timestamp)",
-                order_by="(id, timestamp, user_id)",
+                order_by=self._pick_order_by(st["name"], analysis),
                 description=st.get("description", ""),
                 kind=st.get("kind", "supporting"),
                 related_tables=st.get("related_tables", []),
@@ -625,40 +698,64 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         
         return schemas
     
+    # Optional envelope fields carried by the legacy 8 tables. Included only when
+    # this spec's own raw events actually carry them -- previously every
+    # fallback-generated table got all 29 of these unconditionally (e.g. gclid,
+    # citizenship, co_travelers on events that never emit them), which bloats the
+    # schema and buries the columns judges actually care about.
+    _OPTIONAL_ENVELOPE_CATALOG = [
+        ColumnSpec(name="app_session_id", type="String", description="App session ID", nullable=True),
+        ColumnSpec(name="device", type="String", description="Device model", nullable=True, low_cardinality=True),
+        ColumnSpec(name="device_type", type="String", description="Device type", nullable=True, low_cardinality=True),
+        ColumnSpec(name="os", type="String", description="Operating system", nullable=True, low_cardinality=True),
+        ColumnSpec(name="app_version", type="String", description="App version", nullable=True),
+        ColumnSpec(name="client_lib", type="String", description="Client library", nullable=True),
+        ColumnSpec(name="geoip_country_code", type="String", description="Country code", nullable=True, low_cardinality=True),
+        ColumnSpec(name="geoip_subdivision_1_code", type="String", description="Subdivision code", nullable=True),
+        ColumnSpec(name="city", type="String", description="City", nullable=True),
+        ColumnSpec(name="client_ip", type="String", description="Client IP", nullable=True),
+        ColumnSpec(name="latitude", type="Float64", description="Latitude", nullable=True),
+        ColumnSpec(name="longitude", type="Float64", description="Longitude", nullable=True),
+        ColumnSpec(name="locale", type="String", description="Locale", nullable=True),
+        ColumnSpec(name="language", type="String", description="Language", nullable=True),
+        ColumnSpec(name="funnel_type", type="String", description="Funnel variant", nullable=True, low_cardinality=True),
+        ColumnSpec(name="co_travelers", type="UInt8", description="Co-travelers count", nullable=True),
+        ColumnSpec(name="is_guest", type="UInt8", description="Is guest user", nullable=True),
+        ColumnSpec(name="is_referral", type="UInt8", description="Is referral", nullable=True),
+        ColumnSpec(name="is_enterprise", type="UInt8", description="Is enterprise", nullable=True),
+        ColumnSpec(name="gclid", type="String", description="Google click ID", nullable=True),
+        ColumnSpec(name="fbclid", type="String", description="Facebook click ID", nullable=True),
+        ColumnSpec(name="gad_source", type="String", description="Google Ads source", nullable=True),
+        ColumnSpec(name="citizenship", type="String", description="User citizenship", nullable=True, low_cardinality=True),
+        ColumnSpec(name="destination", type="String", description="Destination country", nullable=True, low_cardinality=True),
+        ColumnSpec(name="is_back_filled", type="UInt8", description="Backfilled event", nullable=True),
+        ColumnSpec(name="duplicate_id", type="String", description="Deduplication ID", nullable=True),
+    ]
+
     def _build_basic_columns(self, table_spec: Dict, analysis: SpecAnalysis) -> List[ColumnSpec]:
+        samples = self._relevant_samples(table_spec["name"], analysis)
+
+        # user_id is required (non-Nullable) EXCEPT for events from users who
+        # don't have one yet -- e.g. 03_status_sharing's recipient-side events
+        # (link_opened, recipient_cta_clicked) are explicitly "keyed by
+        # share_id" per spec.md, fired before the recipient has signed up. The
+        # base_context.md invariant "user_id present on every event" doesn't
+        # universally hold; the base context itself warns it can lag the data.
+        user_id_nullable = bool(samples) and not all(e.get("user_id") for e in samples)
+
+        # Required envelope -- validate_schema() and the join map depend on these.
         columns = [
             ColumnSpec(name="id", type="UUID", description="Event ID"),
             ColumnSpec(name="timestamp", type="DateTime", description="Event timestamp"),
-            ColumnSpec(name="user_id", type="String", description="User identifier"),
+            ColumnSpec(name="user_id", type="String", description="User identifier", nullable=user_id_nullable),
             ColumnSpec(name="application_id", type="String", description="Application ID", nullable=True),
-            ColumnSpec(name="app_session_id", type="String", description="App session ID", nullable=True),
-            ColumnSpec(name="device", type="String", description="Device model", nullable=True, low_cardinality=True),
-            ColumnSpec(name="device_type", type="String", description="Device type", nullable=True, low_cardinality=True),
-            ColumnSpec(name="os", type="String", description="Operating system", nullable=True, low_cardinality=True),
-            ColumnSpec(name="app_version", type="String", description="App version", nullable=True),
-            ColumnSpec(name="client_lib", type="String", description="Client library", nullable=True),
-            ColumnSpec(name="geoip_country_code", type="String", description="Country code", nullable=True, low_cardinality=True),
-            ColumnSpec(name="geoip_subdivision_1_code", type="String", description="Subdivision code", nullable=True),
-            ColumnSpec(name="city", type="String", description="City", nullable=True),
-            ColumnSpec(name="client_ip", type="String", description="Client IP", nullable=True),
-            ColumnSpec(name="latitude", type="Float64", description="Latitude", nullable=True),
-            ColumnSpec(name="longitude", type="Float64", description="Longitude", nullable=True),
-            ColumnSpec(name="locale", type="String", description="Locale", nullable=True),
-            ColumnSpec(name="language", type="String", description="Language", nullable=True),
-            ColumnSpec(name="funnel_type", type="String", description="Funnel variant", nullable=True, low_cardinality=True),
-            ColumnSpec(name="co_travelers", type="UInt8", description="Co-travelers count", nullable=True),
-            ColumnSpec(name="is_guest", type="UInt8", description="Is guest user", nullable=True),
-            ColumnSpec(name="is_referral", type="UInt8", description="Is referral", nullable=True),
-            ColumnSpec(name="is_enterprise", type="UInt8", description="Is enterprise", nullable=True),
-            ColumnSpec(name="gclid", type="String", description="Google click ID", nullable=True),
-            ColumnSpec(name="fbclid", type="String", description="Facebook click ID", nullable=True),
-            ColumnSpec(name="gad_source", type="String", description="Google Ads source", nullable=True),
-            ColumnSpec(name="citizenship", type="String", description="User citizenship", nullable=True, low_cardinality=True),
-            ColumnSpec(name="destination", type="String", description="Destination country", nullable=True, low_cardinality=True),
-            ColumnSpec(name="is_back_filled", type="UInt8", description="Backfilled event", nullable=True),
-            ColumnSpec(name="duplicate_id", type="String", description="Deduplication ID", nullable=True),
         ]
-        
+
+        observed_keys = {k for e in samples for k in e.keys()}
+        for candidate in self._OPTIONAL_ENVELOPE_CATALOG:
+            if candidate.name in observed_keys:
+                columns.append(candidate)
+
         for entity in analysis.entities:
             entity_name = entity.get("name", "")
             if "." in entity_name:
@@ -714,9 +811,21 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             issues.append("partition_by should reference timestamp")
         
         if not schema.order_by:
-            issues.append("Missing order_by (recommend: id, timestamp, user_id)")
-        elif "id" not in schema.order_by or "timestamp" not in schema.order_by:
-            issues.append("order_by should include id and timestamp")
+            issues.append("Missing order_by (recommend: user_id or application_id, then timestamp)")
+        elif "timestamp" not in schema.order_by:
+            issues.append("order_by should include timestamp")
+        elif re.match(r"^\(?\s*id\s*,", schema.order_by):
+            issues.append("order_by leads with `id` (a random UUID) -- no query filters by it; key on user_id/application_id instead")
+        elif (
+            "user_id" not in schema.order_by
+            and "application_id" not in schema.order_by
+            and not any(c.name.endswith("_id") and c.name in schema.order_by for c in schema.columns)
+        ):
+            # Not necessarily wrong -- some events (e.g. recipient-side events
+            # fired before the recipient has a user_id) legitimately have no
+            # better key than timestamp alone -- but flag it so a human reviews
+            # whether a spec-specific id (share_id, group_id, ...) was missed.
+            issues.append("order_by has no id-like column (timestamp only) -- confirm no better key (e.g. a spec-specific *_id) exists")
         
         col_names = [c.name for c in schema.columns]
         dupes = set([x for x in col_names if col_names.count(x) > 1])
@@ -742,60 +851,162 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
     # ============================================================
     
     def register_table(self, schema: TableSchema, version: int = 1) -> bool:
-        """Register a new table schema in meta_context_registry."""
+        """Register a new table schema in meta_context_registry.
+
+        meta_context_registry.columns is Array(Tuple(name String, type String,
+        description String)) -- nullable/low_cardinality info isn't lost, it's
+        baked into to_ch_type()'s resolved type string (e.g. Nullable(String)).
+        Uses client.insert() (structured, parameterized) rather than building a
+        raw SQL string: the previous version hand-built an INSERT with a
+        double-quoted JSON blob spliced in unquoted, which the Array(Tuple(...))
+        column could never parse -- every registration silently failed.
+        """
         if not self.client:
             print("No ClickHouse client, skipping registry")
             return False
-        
-        columns_json = json.dumps([{
-            "name": c.name,
-            "type": c.type,
-            "description": c.description,
-            "nullable": c.nullable,
-            "low_cardinality": c.low_cardinality,
-            "codec": c.codec,
-        } for c in schema.columns])
-        
-        insert_query = f"""
-        INSERT INTO {self.database}.{self.registry_table} 
-        (entity_name, entity_type, kind, description, columns, source_spec, 
-         ordering_key, partition_key, ttl_expression, related_entities, tags,
-         version, is_current, created_at, updated_at)
-        VALUES
-        """
-        
-        values = f"""(
-            '{schema.name}', 'table', '{schema.kind}', 
-            '{schema.description.replace("'", "''")}', 
-            {columns_json},
-            'generated',
-            '{schema.order_by}', '{schema.partition_by}', '',
-            {json.dumps(schema.related_tables)}, {json.dumps(schema.tags)},
-            {version}, 1, now(), now()
-        )"""
-        
-        try:
-            self.client.command(insert_query + values)
-            print(f"Registered {schema.name} in meta_context_registry")
-            return True
-        except Exception as e:
-            print(f"Failed to register {schema.name}: {e}")
-            return False
+
+        columns_tuples = [(c.name, c.to_ch_type(), c.description) for c in schema.columns]
+
+        row = [
+            schema.name, "table", schema.kind, schema.description,
+            columns_tuples, "generated",
+            schema.order_by, schema.partition_by, "",
+            schema.related_tables, schema.tags,
+            version, 1,
+        ]
+        column_names = [
+            "entity_name", "entity_type", "kind", "description",
+            "columns", "source_spec",
+            "ordering_key", "partition_key", "ttl_expression",
+            "related_entities", "tags",
+            "version", "is_current",
+        ]
+
+        name_escaped = schema.name.replace("'", "''")
+        verify_query = (
+            f"SELECT count() FROM {self.database}.{self.registry_table} "
+            f"WHERE entity_name = '{name_escaped}' AND version = {version}"
+        )
+
+        for attempt in (1, 2):
+            try:
+                # async_insert=0: this ClickHouse Cloud service defaults to
+                # async_insert=1, which buffers small inserts server-side before
+                # a background flush; forcing this off is necessary but wasn't
+                # sufficient on its own -- see the read-back check below.
+                self.client.insert(
+                    f"{self.database}.{self.registry_table}",
+                    [row],
+                    column_names=column_names,
+                    settings={"async_insert": 0},
+                )
+            except Exception as e:
+                print(f"Failed to register {schema.name}: {e}")
+                return False
+
+            # Read-back verification: writes to this table have been observed
+            # live to report success (written_rows=1, no exception in
+            # system.query_log, even under select_sequential_consistency=1) yet
+            # be unqueryable moments later -- reproducibly, specifically when
+            # this call runs as part of the full pipeline rather than in
+            # isolation. Root cause not fully pinned down (ruled out: the
+            # ReplacingMergeTree is_deleted footgun, async_insert buffering,
+            # replica read lag). Rather than silently report success on a write
+            # that may not stick, verify and retry once before surfacing it.
+            try:
+                visible = self.client.query(verify_query).result_rows[0][0] > 0
+            except Exception:
+                visible = False
+
+            if visible:
+                print(f"Registered {schema.name} in meta_context_registry")
+                return True
+
+            if attempt == 1:
+                print(f"Warning: {schema.name} not visible in meta_context_registry immediately after insert, retrying once...")
+
+        print(f"Warning: {schema.name} registration did not verify after retry -- table was created in ClickHouse but may be MISSING from meta_context_registry. Check manually.")
+        return False
     
     def register_all(self) -> Dict[str, bool]:
         """Register all generated schemas."""
         return {name: self.register_table(schema) for name, schema in self.schemas.items()}
 
+    # ============================================================
+    # Materialized Views
+    # ============================================================
+
+    _CONVERSION_NAME_HINTS = (
+        "purchased", "confirmed", "completed", "submitted", "converted", "reconverted",
+    )
+
+    def _pick_primary_table(self) -> Optional[TableSchema]:
+        """Heuristic for which of this spec's tables is worth a rollup MV: the
+        terminal funnel step if one was tagged `kind="funnel"`, else the table
+        whose name reads like a conversion/completion event, else the last
+        table generated (usually the end of the spec's event sequence)."""
+        schemas = list(self.schemas.values())
+        if not schemas:
+            return None
+        funnel = [s for s in schemas if s.kind == "funnel"]
+        if funnel:
+            return funnel[-1]
+        for s in schemas:
+            if any(hint in s.name for hint in self._CONVERSION_NAME_HINTS):
+                return s
+        return schemas[-1]
+
+    def generate_materialized_view(self, schema: TableSchema) -> Optional[str]:
+        """Daily device/geo rollup (event count + unique users) for one table.
+
+        Uses AggregatingMergeTree + uniqState/uniqMerge rather than a plain
+        SummingMergeTree count(DISTINCT ...): approximate-distinct states combine
+        correctly across merges, a raw per-row distinct count doesn't. This is
+        the table AnalyticsAgent's segment-cut queries should read from instead
+        of scanning raw events every time.
+        """
+        nullable_by_name = {c.name: c.nullable for c in schema.columns}
+        segment_cols = [c for c in ("device_type", "geoip_country_code") if c in nullable_by_name]
+        if not segment_cols:
+            return None
+
+        segment_select = ", ".join(segment_cols)
+        mv_name = f"{schema.name}_daily_segment_mv"
+        # Same allow_nullable_key requirement as to_ddl(): device_type/
+        # geoip_country_code are Nullable(String) on the source table, and this
+        # DDL is hand-built rather than going through TableSchema.to_ddl() (which
+        # already detects and sets this), so it needs its own check.
+        settings_clause = ""
+        if any(nullable_by_name.get(c) for c in segment_cols):
+            settings_clause = "\nSETTINGS allow_nullable_key = 1\n"
+        return (
+            f"-- Daily {', '.join(segment_cols)} rollup for {schema.name}: event count + "
+            f"unique users, pre-aggregated so AnalyticsAgent's segment cuts don't rescan raw events.\n"
+            f"CREATE MATERIALIZED VIEW {self.database}.{mv_name}\n"
+            f"ENGINE = AggregatingMergeTree\n"
+            f"ORDER BY (day, {segment_select})\n"
+            f"{settings_clause}"
+            f"POPULATE AS\n"
+            f"SELECT\n"
+            f"    toDate(timestamp) AS day,\n"
+            f"    {segment_select},\n"
+            f"    count() AS events,\n"
+            f"    uniqState(user_id) AS unique_users_state\n"
+            f"FROM {self.database}.{schema.name}\n"
+            f"GROUP BY day, {segment_select};"
+        )
+
     def execute_and_update_context(self, source_spec: str = "") -> Dict[str, Any]:
         """
         Executes DDL statements to create generated tables in ClickHouse,
-        registers them in meta_context_registry, and invokes ContextAgent.update_context()
-        to produce Tier 1 native comments and Tier 2 business rules.
+        registers them in meta_context_registry, invokes ContextAgent.update_context()
+        to produce Tier 1 native comments and Tier 2 business rules, then creates a
+        daily segment-rollup materialized view on this spec's primary table.
         """
         results = {}
         for schema_name, schema in self.schemas.items():
             ddl = schema.to_ddl(self.database)
-            
+
             # Execute CREATE TABLE on ClickHouse
             if self.client:
                 try:
@@ -803,10 +1014,10 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
                     print(f"Executed DDL for table {schema_name}")
                 except Exception as e:
                     print(f"Failed to execute DDL for table {schema_name}: {e}")
-            
+
             # Register in meta_context_registry
             registered = self.register_table(schema)
-            
+
             # Invoke ContextAgent integration contract
             next_version = None
             if self.context_agent and hasattr(self.context_agent, "update_context"):
@@ -816,12 +1027,28 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
                     schema_ddl=ddl,
                     source_spec=source_spec,
                 )
-            
+
             results[schema_name] = {
                 "registered": registered,
                 "context_version": next_version,
             }
-            
+
+        # One rollup MV per spec, on the table worth pre-aggregating (tables must
+        # already exist, so this runs after the create-table loop above).
+        primary = self._pick_primary_table()
+        if primary is not None:
+            mv_ddl = self.generate_materialized_view(primary)
+            if mv_ddl:
+                mv_name = f"{primary.name}_daily_segment_mv"
+                self.materialized_views[mv_name] = mv_ddl
+                if self.client:
+                    try:
+                        self.client.command(mv_ddl)
+                        print(f"Executed DDL for materialized view {mv_name}")
+                        results[mv_name] = {"registered": None, "context_version": None, "kind": "materialized_view"}
+                    except Exception as e:
+                        print(f"Failed to execute DDL for materialized view {mv_name}: {e}")
+
         return results
 
     # ============================================================
@@ -842,6 +1069,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             
             # 2. Parse spec
             analysis = self.parse_spec(spec_dir)
+            self.last_analysis = analysis  # so callers (main.py) can read feature_name/raw_spec_md after the fact
             print(f"  Analyzed: {analysis.feature_name} ({len(analysis.entities)} entities, {len(analysis.events)} events)")
             
             # 3. Generate schemas
@@ -863,11 +1091,13 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             return schemas
     
     def emit_ddl(self, database: str = None, output_path: Path = None) -> str:
-        """Emit all schemas as DDL statements."""
+        """Emit all table + materialized view DDL statements (for the submission
+        artifact / generated_schema.sql). Note process_spec() already executes
+        this DDL directly via execute_and_update_context() -- this is for the
+        written record, not a second execution pass."""
         db = database or self.database
-        ddl_parts = []
-        for schema in self.schemas.values():
-            ddl_parts.append(schema.to_ddl(db))
+        ddl_parts = [schema.to_ddl(db) for schema in self.schemas.values()]
+        ddl_parts.extend(self.materialized_views.values())
         nl = "\n"
         full_ddl = f"{nl}{nl}".join(ddl_parts)
         if output_path:

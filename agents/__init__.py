@@ -15,18 +15,24 @@ from .instrumentation.agent import InstrumentationAgent
 from .analytics.agent import AnalyticsAgent
 from .context.agent import ContextAgent
 from .tracing.agent import TracingAgent
-from .visualization.agent import VisualizationAgent
-from .config import ClickHouseConfig, LangfuseConfig, OpenRouterConfig, load_dotenv, get_config
+from .config import (
+    ClickHouseConfig,
+    LangfuseConfig,
+    OpenRouterConfig,
+    load_dotenv,
+    get_config,
+    make_llm_call_fn,
+)
 
 __all__ = [
     "InstrumentationAgent",
     "AnalyticsAgent",
     "ContextAgent",
     "TracingAgent",
-    "VisualizationAgent",
     "ClickHouseConfig",
     "LangfuseConfig",
     "OpenRouterConfig",
     "load_dotenv",
     "get_config",
+    "make_llm_call_fn",
 ]
