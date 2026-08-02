@@ -48,6 +48,23 @@ def get_clickhouse_client(ch_config):
         database=ch_config.database,
     )
 
+
+def format_insights_for_chat(insights: List[Any]) -> str:
+    if not insights:
+        return "No insights were generated yet."
+
+    lines: List[str] = []
+    for insight in insights:
+        title = getattr(insight, "title", "Insight")
+        desc = getattr(insight, "description", "")
+        metric = getattr(insight, "metric", "N/A")
+        value = getattr(insight, "value", "N/A")
+        severity = getattr(insight, "severity", "info").upper()
+        lines.append(f"- **{title}** [{severity}]")
+        lines.append(f"  {desc}")
+        lines.append(f"  Metric: {metric} | Value: {value}")
+    return "\n".join(lines)
+
 # -----------------------------------------------------------------------------
 # Page Configuration & Styling
 # -----------------------------------------------------------------------------
@@ -302,7 +319,7 @@ if run_clicked:
                             st.warning(f"Ingestion warning for `{table_name}`: {e}")
 
         # 5. Analytics Agent Phase
-        if run_analytics and ch_client:
+        if run_analytics and ch_client and st.session_state.get("analytics_question"):
             status_text.text("📊 [Analytics Agent] Executing ClickHouse analysis & context link...")
             progress_bar.progress(90)
             aa = AnalyticsAgent(
@@ -311,7 +328,12 @@ if run_clicked:
                 context_agent=None,
                 openrouter_config=or_config if or_config and or_config.enabled else None,
             )
-            st.session_state["insights"] = aa.run_full_analysis()
+            question = st.session_state.get("analytics_question", "").strip()
+            pm_questions = [question] if question else None
+            st.session_state["insights"] = aa.run_full_analysis(
+                pm_questions=pm_questions,
+                spec_name=spec_option or effective_spec_path.name if effective_spec_path else "",
+            )
 
         progress_bar.progress(100)
         status_text.text("✅ Pipeline run completed successfully!")
@@ -327,7 +349,63 @@ if run_clicked:
 if "schemas" in st.session_state or "insights" in st.session_state:
     st.header("2. Pipeline Output & Results")
 
-    tab_schema, tab_insights = st.tabs(["📋 Schemas & DDL", "💡 Business Insights"])
+    tab_insights, tab_schema = st.tabs(["💡 Business Insights", "📋 Schemas & DDL"])
+
+    with tab_insights:
+        if "schemas" in st.session_state:
+            schemas_map = normalize_schemas(st.session_state.get("schemas"))
+            st.subheader("New tables added")
+            table_names = list(schemas_map.keys())
+            if table_names:
+                st.table({"Table Name": table_names})
+            else:
+                st.info("No new tables were generated.")
+
+        st.divider()
+        st.subheader("Ask for the insight")
+        st.caption("Type a question like 'Which segment converts best?' and the analytics agent will respond with focused insights.")
+
+        prompt = st.chat_input("Ask the analytics agent...")
+        if prompt:
+            with st.spinner("Generating insight cards..."):
+                client = get_clickhouse_client(ch_config)
+                if client is None:
+                    st.error("ClickHouse is not available right now, so I cannot generate insights.")
+                else:
+                    aa = AnalyticsAgent(
+                        client=client,
+                        database=ch_config.database if ch_config else "atlys",
+                        context_agent=None,
+                        openrouter_config=or_config if or_config and or_config.enabled else None,
+                    )
+                    spec_name = spec_option or (effective_spec_path.name if effective_spec_path else "")
+                    insights = aa.run_full_analysis(
+                        pm_questions=[prompt],
+                        spec_name=spec_name,
+                    )
+                    st.session_state["insights"] = insights
+
+        if "insights" in st.session_state and st.session_state["insights"]:
+            st.divider()
+            st.subheader("Latest response")
+            insights = st.session_state["insights"][:6]
+            for insight in insights:
+                sev = getattr(insight, "severity", "info").lower()
+                title = getattr(insight, "title", "Insight")
+                metric = getattr(insight, "metric", "N/A")
+                value = getattr(insight, "value", "N/A")
+
+                if sev in ["high", "critical", "error"]:
+                    st.error(f"### {title}")
+                elif sev in ["medium", "warning"]:
+                    st.warning(f"### {title}")
+                else:
+                    st.info(f"### {title}")
+
+                st.caption(f"**Metric:** `{metric}`")
+                st.caption(f"**Value:** `{value}`")
+        else:
+            st.info("Ask a question to start the analytics insight cards.")
 
     with tab_schema:
         if "schemas" in st.session_state:
@@ -335,7 +413,7 @@ if "schemas" in st.session_state or "insights" in st.session_state:
             st.subheader("Generated ClickHouse Schemas")
             for table_name, schema in schemas_map.items():
                 with st.expander(
-                    f" Table: `{table_name}` ({len(schema.columns)} columns)",
+                    f"Table: `{table_name}` ({len(schema.columns)} columns)",
                     expanded=True,
                 ):
                     table_data = [
@@ -348,47 +426,14 @@ if "schemas" in st.session_state or "insights" in st.session_state:
                     ]
                     st.table(table_data)
 
-            st.subheader("Production DDL SQL Output")
-            st.code(st.session_state.get("ddl", "-- No DDL"), language="sql")
+            st.subheader("Production DDL")
+            ddl = st.session_state.get("ddl", "-- No DDL")
+            st.text_area("DDL", ddl, height=300)
             st.download_button(
                 "📥 Download DDL Script (.sql)",
-                data=st.session_state.get("ddl", ""),
+                data=ddl,
                 file_name="clickhouse_instrumentation.sql",
                 mime="text/x-sql",
             )
-
-    with tab_insights:
-        if "insights" in st.session_state:
-            insights = st.session_state["insights"]
-            st.subheader(f"Generated Executive Insights ({len(insights)})")
-
-            for insight in insights:
-                sev = getattr(insight, "severity", "info").lower()
-                title = getattr(insight, "title", "Insight Alert")
-                desc = getattr(insight, "description", "")
-                metric = getattr(insight, "metric", "N/A")
-                val = getattr(insight, "value", "N/A")
-                tags = getattr(insight, "tags", [])
-
-                if sev in ["high", "critical", "error"]:
-                    st.error(f"### {title}")
-                elif sev in ["medium", "warning"]:
-                    st.warning(f"### {title}")
-                else:
-                    st.info(f"### {title}")
-
-                st.write(desc)
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown(f"**Metric:** `{metric}`")
-                with col_b:
-                    st.markdown(f"**Calculated Value:** `{val}`")
-
-                if tags:
-                    st.caption(f"**Tags:** {', '.join(tags)}")
-
-                    if tags:
-                        st.caption(f"**Tags:** {', '.join(tags)}")
         else:
-            st.info("No insights stored in session state. Run the Analytics Agent to generate insights.")
+            st.info("No schema data is available yet.")
