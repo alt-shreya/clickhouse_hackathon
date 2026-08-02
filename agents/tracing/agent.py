@@ -3,235 +3,151 @@ Tracing Agent
 Langfuse v4 integration for full pipeline tracing.
 """
 
-from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field
-from datetime import datetime
-from contextlib import contextmanager
-from pathlib import Path
-import json
-import os
+import sys
 import uuid
+from contextlib import contextmanager
+from typing import Any, Dict, Optional
 
+from langfuse import Langfuse
 
-@dataclass
-class TraceSpan:
-    name: str
-    trace_id: str
-    span_id: str
-    parent_span_id: Optional[str] = None
-    start_time: datetime = field(default_factory=datetime.now)
-    end_time: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    input_data: Dict[str, Any] = field(default_factory=dict)
-    output_data: Dict[str, Any] = field(default_factory=dict)
-    status: str = "running"
-    error: Optional[str] = None
+import agents.config
 
 
 class TracingAgent:
-    def __init__(
-        self,
-        public_key: str = None,
-        secret_key: str = None,
-        host: str = None,
-        enabled: bool = True,
-    ):
-        self.enabled = enabled
-        self.spans: Dict[str, TraceSpan] = {}
+
+    def __init__(self):
+        self.enabled = False
+        self.client = None
         self.current_trace_id: Optional[str] = None
-        self.current_span_id: Optional[str] = None
-        self._active_trace_ctx = None
-        self._active_span_ctx_stack: List[Any] = []
-        self._fallback_events: List[Dict[str, Any]] = []
-        self.langfuse = None
+        self._trace_ctx = None
 
-        if enabled:
+        try:
+            _, lf_config, _ = agents.config.get_config()
+        except Exception as e:
+            print(f"[Tracing Notice] Could not load Langfuse config: {e}")
+            return
+
+        if lf_config.enabled and lf_config.public_key and lf_config.secret_key:
             try:
-                from langfuse import Langfuse
-
-                self.langfuse = Langfuse(
-                    public_key=public_key or os.getenv("LANGFUSE_PUBLIC_KEY"),
-                    secret_key=secret_key or os.getenv("LANGFUSE_SECRET_KEY"),
-                    base_url=host or os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST") or "https://cloud.langfuse.com",
+                self.client = Langfuse(
+                    public_key=lf_config.public_key,
+                    secret_key=lf_config.secret_key,
+                    base_url=lf_config.host,
                 )
-
-                if not self.langfuse:
-                    self.enabled = False
+                self.enabled = True
             except Exception as e:
-                print(f"Failed to initialize Langfuse client: {e}")
-                self.enabled = False
+                print(f"[Tracing Notice] Could not initialize Langfuse client: {e}")
 
-    def _record_fallback(self, kind: str, payload: Dict[str, Any]):
-        self._fallback_events.append(
-            {
-                "kind": kind,
-                "trace_id": self.current_trace_id,
-                "timestamp": datetime.now().isoformat(),
-                **payload,
-            }
-        )
+    def _active(self) -> bool:
+        return bool(self.enabled and self.client)
 
     def start_trace(self, name: str, metadata: Dict[str, Any] = None) -> str:
+        """Open a root observation that stays active until end_span()/flush()."""
         trace_id = str(uuid.uuid4())
         self.current_trace_id = trace_id
 
-        if self.enabled and self.langfuse:
+        if self._active():
             try:
-                self._active_trace_ctx = self.langfuse.start_as_current_observation(
+                self._trace_ctx = self.client.start_as_current_observation(
                     name=name,
                     as_type="agent",
                     input=metadata or {},
                     metadata=metadata or {},
                     end_on_exit=False,
                 )
-                self._active_trace_ctx.__enter__()
+                self._trace_ctx.__enter__()
             except Exception as e:
-                print(f"Warning: failed to start Langfuse trace: {e}")
-                self._record_fallback("trace_error", {"name": name, "metadata": metadata or {}, "error": str(e)})
+                print(f"[Tracing Warning] start_trace '{name}' failed: {e}")
+                self._trace_ctx = None
+
         return trace_id
 
-    def start_span(self, name: str, metadata: Dict[str, Any] = None, input_data: Dict[str, Any] = None) -> str:
-        if not self.current_trace_id:
-            self.start_trace("pipeline")
-
-        span_id = str(uuid.uuid4())
-        parent_id = self.current_span_id
-        self.current_span_id = span_id
-
-        self.spans[span_id] = TraceSpan(
-            name=name,
-            trace_id=self.current_trace_id,
-            span_id=span_id,
-            parent_span_id=parent_id,
-            metadata=metadata or {},
-            input_data=input_data or {},
-        )
-
-        if self.enabled and self.langfuse:
-            try:
-                span_ctx = self.langfuse.start_as_current_observation(
-                    name=name,
-                    as_type="span",
-                    input=input_data or {},
-                    metadata=metadata or {},
-                    end_on_exit=False,
-                )
-                self._active_span_ctx_stack.append(span_ctx)
-                span_ctx.__enter__()
-            except Exception as e:
-                self._record_fallback("span_error", {"span_id": span_id, "name": name, "error": str(e)})
-
-        return span_id
-
-    def end_span(self, span_id: str, output_data: Dict[str, Any] = None, status: str = "success", error: str = None):
-        if span_id not in self.spans:
+    def end_span(self, trace_id: str, status: str = "success", error: str = None):
+        """End the root observation opened by start_trace(), if it's still the active one."""
+        if trace_id != self.current_trace_id or self._trace_ctx is None:
             return
 
-        span = self.spans[span_id]
-        span.end_time = datetime.now()
-        span.output_data = output_data or {}
-        span.status = status
-        span.error = error
-
-        if self.enabled and self.langfuse:
+        if self._active():
             try:
-                self.langfuse.update_current_span(
-                    output=output_data or {},
-                    metadata={**span.metadata, "status": status, **({"error": error} if error else {})},
+                self.client.update_current_span(
+                    metadata={"status": status, **({"error": error} if error else {})},
                     level="ERROR" if status == "error" else "DEFAULT",
                     status_message=error,
                 )
             except Exception as e:
-                self._record_fallback("end_span_error", {"span_id": span_id, "status": status, "error": str(e)})
+                print(f"[Tracing Warning] end_span failed: {e}")
 
-        if self._active_span_ctx_stack:
-            span_ctx = self._active_span_ctx_stack.pop()
-            try:
-                span_ctx.__exit__(None, None, None)
-            except Exception as e:
-                self._record_fallback("span_exit_error", {"span_id": span_id, "error": str(e)})
-
-        self.current_span_id = span.parent_span_id
+        try:
+            self._trace_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        self._trace_ctx = None
+        self.current_trace_id = None
 
     @contextmanager
-    def trace_span(self, name: str, metadata: Dict[str, Any] = None, input_data: Dict[str, Any] = None):
-        span_id = self.start_span(name, metadata, input_data)
+    def trace_span(self, name: str, input_data: Dict[str, Any] = None, metadata: Dict[str, Any] = None):
+        """Context manager for a nested span; safe to use bare (`with tracer.trace_span(...):`)."""
+        if not self._active():
+            yield None
+            return
+
         try:
-            yield span_id
-            self.end_span(span_id, status="success")
+            cm = self.client.start_as_current_observation(
+                name=name,
+                as_type="span",
+                input=input_data or {},
+                metadata=metadata or {},
+            )
+            span = cm.__enter__()
         except Exception as e:
-            self.end_span(span_id, status="error", error=str(e))
+            print(f"[Tracing Warning] Span '{name}' failed to start: {e}")
+            yield None
+            return
+
+        try:
+            yield span
+        except BaseException:
+            cm.__exit__(*sys.exc_info())
             raise
+        else:
+            cm.__exit__(None, None, None)
 
     def log_generation(self, name: str, model: str, prompt: str, completion: str, metadata: Dict[str, Any] = None):
-        if not self.current_trace_id:
-            self.start_trace("llm_generation")
-
-        if self.enabled and self.langfuse:
-            try:
-                self.langfuse.start_as_current_observation(
-                    name=name,
-                    as_type="generation",
-                    trace_id=self.current_trace_id,
-                    input={"prompt": prompt},
-                    output={"completion": completion},
-                    metadata={**(metadata or {}), "model": model},
-                )
-            except Exception as e:
-                self._record_fallback("generation_error", {"name": name, "model": model, "error": str(e)})
-
-    def log_event(self, name: str, properties: Dict[str, Any] = None):
-        if self.enabled and self.langfuse:
-            try:
-                self.langfuse.create_event(
-                    trace_id=self.current_trace_id,
-                    name=name,
-                    metadata=properties or {},
-                )
-            except Exception as e:
-                self._record_fallback("event_error", {"name": name, "error": str(e)})
+        if not self._active():
+            return
+        try:
+            with self.client.start_as_current_observation(
+                name=name,
+                as_type="generation",
+                input={"prompt": prompt},
+                output={"completion": completion},
+                metadata={**(metadata or {}), "model": model},
+            ):
+                pass
+        except Exception as e:
+            print(f"[Tracing Warning] log_generation '{name}' failed: {e}")
 
     def flush(self):
-        if self.enabled and self.langfuse:
+        if self._trace_ctx is not None:
             try:
-                if self._active_trace_ctx is not None:
-                    try:
-                        self._active_trace_ctx.__exit__(None, None, None)
-                    finally:
-                        self._active_trace_ctx = None
-                self.langfuse.flush()
+                self._trace_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._trace_ctx = None
+            self.current_trace_id = None
+
+        if self._active():
+            try:
+                self.client.flush()
             except Exception as e:
-                self._record_fallback("flush_error", {"error": str(e)})
+                print(f"[Tracing Warning] flush failed: {e}")
 
-        if self._fallback_events:
-            out_dir = Path("traces")
-            out_dir.mkdir(exist_ok=True)
-            fallback_file = out_dir / f"{self.current_trace_id or 'trace'}.jsonl"
-            with fallback_file.open("a", encoding="utf-8") as f:
-                for event in self._fallback_events:
-                    f.write(json.dumps(event, default=str) + "\n")
-
-    def get_trace_summary(self, trace_id: str = None) -> Dict[str, Any]:
-        tid = trace_id or self.current_trace_id
-        if not tid:
-            return {}
-
-        trace_spans = [s for s in self.spans.values() if s.trace_id == tid]
-        return {
-            "trace_id": tid,
-            "span_count": len(trace_spans),
-            "spans": [
-                {
-                    "name": s.name,
-                    "span_id": s.span_id,
-                    "parent_span_id": s.parent_span_id,
-                    "duration_ms": (s.end_time - s.start_time).total_seconds() * 1000 if s.end_time else None,
-                    "status": s.status,
-                    "error": s.error,
-                }
-                for s in trace_spans
-            ],
-        }
+    def shutdown(self):
+        if self.client:
+            try:
+                self.client.shutdown()
+            except Exception:
+                pass
 
 
 _default_tracer: Optional[TracingAgent] = None

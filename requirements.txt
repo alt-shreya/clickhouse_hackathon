@@ -1,26 +1,26 @@
-# ClickHouse client -- used directly in load_base_context.py, audit_base_context.py, context_agent.py
-clickhouse-connect>=0.7.19
-
-# Anthropic SDK -- for llm_call_fn (context_audit / context_update calls, and later
-# the Instrumentation/Analytics agents' LLM calls)
-anthropic>=0.39.0
+# All three agents (Context/Instrumentation/Analytics) share one LLM provider,
+# resolved by agents/config.py:get_config(). Anthropic is preferred when
+# ANTHROPIC_API_KEY is set (agents/config.py:AnthropicConfig, adapted to the
+# same OpenAI-shaped .chat.completions.create() interface every agent call
+# site uses); OpenRouter (OPENROUTER_API_KEY, via the `openai` package below)
+# is the fallback -- kept for when Anthropic isn't configured, or its shared
+# free-tier model is preferred for cost reasons despite being less reliable.
 
 # Langfuse -- required by the problem statement for tracing every LLM call and SQL span
 langfuse>=2.53.0
 
 # python-dotenv -- convenience for loading CLICKHOUSE_*/ANTHROPIC_*/LANGFUSE_* env vars
 # from a local .env instead of hardcoding credentials in scripts
-python-dotenv>=1.0.1
-# Atlys Click-a-thon 2026 - Agent System Dependencies
+
 
 # Core
 clickhouse-connect>=1.6.0
 
-# Tracing (optional)
-langfuse>=2.0.0
-
-# LLM (OpenRouter - OpenAI compatible)
+# LLM (OpenRouter - OpenAI compatible; fallback provider)
 openai>=1.0.0
+
+# LLM (Anthropic direct; preferred provider when ANTHROPIC_API_KEY is set)
+anthropic>=0.40.0
 
 # Data processing
 pandas>=2.0.0
@@ -28,7 +28,8 @@ numpy>=1.24.0
 
 # Utilities
 pyyaml>=6.0
-python-dotenv>=1.0.0
+python-dotenv>=1.0.1
+
 
 # Development
 pytest>=7.0.0

@@ -2,4 +2,6 @@
 agents/__pycache__/**/*
 .venv
 specs/
+data/
 __pycache__
+agents/.pytest_cache/
