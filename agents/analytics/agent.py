@@ -135,17 +135,17 @@ LUCKY_QUERIES: List[Dict[str, str]] = [
 # both real, previously hand-written analyses, not toy examples. The point isn't
 # these exact queries; it's "aggregate down to a handful of meaningful rows" instead
 # of a flat multi-dimension dump.
-_GOOD_QUERY_EXAMPLES = """=== EXAMPLE 1: bucketed segment comparison (not a raw per-value breakdown) ===
+_GOOD_QUERY_EXAMPLES = """=== EXAMPLE 1: bucketed segment comparison (countIf/avgIf, not CASE/SUM(CASE...)) ===
 SELECT
     CASE
         WHEN lower(citizenship) IN ('in', 'pk') THEN 'Latin / Major Script (IN, PK)'
         ELSE 'Non-Latin / Other Script (Other)'
     END AS citizenship_group,
     count() AS total_uploads,
-    sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS uploads_with_retries,
-    round(sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) * 100.0 / nullIf(count(), 0), 2) AS pct_with_retries,
-    round(avg(retry_count), 2) AS avg_retry_count,
-    sum(is_crossed_failed_attempt_threshold) AS threshold_failures
+    countIf(retry_count > 0) AS uploads_with_retries,
+    round(countIf(retry_count > 0) * 100.0 / nullIf(count(), 0), 2) AS pct_with_retries,
+    round(avgIf(retry_count, retry_count > 0), 2) AS avg_retries_when_retried,
+    countIf(coalesce(is_crossed_failed_attempt_threshold, 0) = 1) AS threshold_failures
 FROM atlys.document_uploaded
 WHERE lower(doc_type) LIKE '%passport%'
 GROUP BY citizenship_group
@@ -237,7 +237,7 @@ class AnalyticsAgent:
     # of legitimate rows -- see handle_insight_request()'s "narrow it" hint.
     _BROAD_RESULT_HINT_THRESHOLD = 150
 
-    def __init__(self, client, database: str, context_agent=None, openrouter_config=None):
+    def __init__(self, client, database: str, context_agent=None, openrouter_config=None, mcp_client=None):
         self.client = client
         self.database = database
         self.context_agent = context_agent
@@ -248,10 +248,19 @@ class AnalyticsAgent:
         if openrouter_config and openrouter_config.enabled:
             self._llm_client = openrouter_config.get_client()
 
+        # When set (see main.py's analytics stage), every ClickHouse read this
+        # agent makes goes through the ClickHouse MCP server instead of the
+        # clickhouse_connect client directly -- `client` is still kept around as
+        # the fallback for standalone/test usage that doesn't wire an MCP client up.
+        self.mcp_client = mcp_client
+
     def run_query(self, query: str) -> List[Dict]:
         """Execute a query and return results as list of dicts. This is the one
         place any agent code -- deterministic or LLM-generated -- actually talks
-        to ClickHouse."""
+        to ClickHouse (via the ClickHouse MCP server when configured, otherwise
+        directly through clickhouse_connect)."""
+        if self.mcp_client is not None:
+            return self.mcp_client.run_select_query(query)
         result = self.client.query(query)
         columns = result.column_names
         return [dict(zip(columns, row)) for row in result.result_rows]
@@ -453,6 +462,15 @@ Other rules:
   `ts - INTERVAL 7 DAY`. A bare `ts + 30 DAY` (no INTERVAL) is a ClickHouse
   SYNTAX_ERROR, not shorthand -- this applies every single time you add/subtract
   a duration, including inside JOIN ... ON clauses, not just in WHERE.
+- Prefer ClickHouse's conditional aggregate functions over generic
+  CASE/SUM(CASE...) patterns: use `countIf(cond)`, `sumIf(cond, val)`, and
+  `avgIf(cond, val)` instead of `sum(CASE WHEN cond THEN 1 ELSE 0 END)` or
+  `avg(CASE WHEN cond THEN val END)` -- they're shorter, clearer, and this is
+  exactly the kind of engine-native function the query should showcase, not
+  portable-but-generic ANSI SQL. Use `coalesce(col, default)` for any nullable
+  column rather than leaving a NULL to silently drop out of an aggregate. Use
+  `windowFunnel()` (see Example 3) for any "did step B happen after step A"
+  question rather than self-joins.
 
 {_GOOD_QUERY_EXAMPLES}
 Match this style: CTEs when the logic has real stages, CASE-based bucketing over raw
@@ -644,9 +662,9 @@ Return only the SQL statement."""
             GROUP BY {id_column}
         )
         """
-        result = self.client.query(query)
-        row = result.result_rows[0] if result.result_rows else [0] * len(steps)
-        return dict(zip(steps, row))
+        rows = self.run_query(query)
+        row = rows[0] if rows else {f"step_{i + 1}": 0 for i in range(len(steps))}
+        return {step: row.get(f"step_{i + 1}", 0) for i, step in enumerate(steps)}
 
     def get_funnel_metrics(self) -> Dict[str, Any]:
         """Sequential funnel over the 4 core pre-purchase steps."""
@@ -997,6 +1015,7 @@ if __name__ == "__main__":
     import clickhouse_connect
     from agents.config import get_config, make_llm_call_fn
     from agents.context.agent import ContextAgent
+    from agents.analytics.mcp_client import ClickHouseMCPClient
 
     ch_config, lf_config, or_config = get_config()
     client = clickhouse_connect.get_client(
@@ -1012,10 +1031,16 @@ if __name__ == "__main__":
     if or_config.enabled:
         context_agent = ContextAgent(client=client, llm_call_fn=make_llm_call_fn(or_config))
 
-    agent = AnalyticsAgent(
-        client=client,
-        database=ch_config.database,
-        context_agent=context_agent,
-        openrouter_config=or_config,
-    )
-    agent.run_interactive()
+    mcp_client = ClickHouseMCPClient.connect_or_none(ch_config)
+    try:
+        agent = AnalyticsAgent(
+            client=client,
+            database=ch_config.database,
+            context_agent=context_agent,
+            openrouter_config=or_config,
+            mcp_client=mcp_client,
+        )
+        agent.run_interactive()
+    finally:
+        if mcp_client is not None:
+            mcp_client.close()
