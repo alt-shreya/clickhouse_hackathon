@@ -13,9 +13,9 @@ Meet the little voices inside your data.
 > Much like a cartographer looks to Atlas for answers, your team can now look to this agentic workflow for answers.
 
 Insight Out takes a raw feature spec (a markdown doc plus an `.ndjson` sample events file) and runs it through a multi-agent system: 
-* an **Instrumentation Agent** that designs and executes the ClickHouse DDL for the new feature 
-* an **Analytics Agent** that runs sequenced funnel and segment analysis over both the new tables and the existing funnel and writes a PM-readable insight report, and 
-* a **Context Agent** that keeps a single living business-context document up to date as new tables get instrumented and flags anything that goes stale or contradictory. 
+* an **Instrumentation Agent** `agents/instrumentation/agent.py` that designs and executes the ClickHouse DDL for the new feature 
+* an **Analytics Agent** `agents/analytics/agent.py` that runs sequenced funnel and segment analysis over both the new tables and the existing funnel and writes a PM-readable insight report, and 
+* a **Context Agent** `agents/context/agent.py` that keeps a single living business-context document up to date as new tables get instrumented and flags anything that goes stale or contradictory. 
 
 Every run is traced end to end in Langfuse, and displayed to the user via STreamlit.
 
@@ -33,32 +33,19 @@ Insight Out is three agents plus a shared context layer, run sequentially by
 `main.py` for a single spec directory: **Context → Instrumentation → Analytics →
 Visualization**.
 
-- **Instrumentation Agent** (`agents/instrumentation/`) reads a feature spec and
-  generates ClickHouse table DDL plus a daily segment-rollup materialized view,
-  executes it against the live ClickHouse Cloud service, and registers the new
-  tables' schema in `atlys.meta_context_registry`.
+- **Instrumentation Agent** (`agents/instrumentation/`) reads a feature spec and generates ClickHouse table DDL plus a daily segment-rollup materialized view, executes it against the live ClickHouse Cloud service, and registers the new tables' schema in `atlys.meta_context_registry`.
 
-- **Analytics Agent** (`agents/analytics/`) hands off from Instrumentation once
-  the new tables exist. on an interactive terminal run, it actually
-   asks the user what insight they'd like to see next -- in plain English -- and
-   acts on it: it turns that request into a single read-only ClickHouse SQL query
-   itself (the LLM's only job is writing the SQL; ClickHouse does 100% of the
-   aggregation once it runs), executes it, and interprets the returned rows into
-   grounded narrative insights before looping back to ask again.
+- **Analytics Agent** (`agents/analytics/`) hands off from Instrumentation once the new tables exist. on an interactive terminal run, it actually
+   asks the user what insight they'd like to see next -- in plain English -- and acts on it: it turns that request into a single read-only ClickHouse SQL query itself (the LLM's only job is writing the SQL; ClickHouse does 100% of the aggregation once it runs), executes it, and interprets the returned rows into grounded narrative insights before looping back to ask again.
 
-- **Context Agent** (`agents/context/`) runs both before and after the other two:
-  it seeds/reads the current business-context document going in, and after
+- **Context Agent** (`agents/context/`) runs both before and after the other two: it seeds/reads the current business-context document going in, and after
   Instrumentation creates new tables, it auto-documents them in the base_context. A deterministic freshness check (does every
-  registered table still exist?) plus an LLM pass surface contradictions, gaps,
-  and obsolete facts into an "Open flags" section.
+  registered table still exist?) plus an LLM pass surface contradictions, gaps, and obsolete facts into an "Open flags" section.
 
-**Where the context layer lives, and why:** the whole business-context document is
-stored as **one Markdown blob per version** in a ClickHouse table,
-`analytics_context.business_context` (`doc_id`, `content`, `version`,
-`changelog_summary`, `updated_at`), a `ReplacingMergeTree` keyed on `doc_id`. 
+**Where the context layer lives, and why:** the whole business-context document is stored as **one Markdown blob per version** in a ClickHouse table,
+`analytics_context.business_context` (`doc_id`, `content`, `version`, `changelog_summary`, `updated_at`), a `ReplacingMergeTree` keyed on `doc_id`. 
 
-Every change — the initial seed, an auto-documented table, a new audit flag, a resolved flag — is a new `INSERT` with `version = previous + 1` rather than a mutation. That makes the table double as its own audit trail: readers always
-`ORDER BY version DESC LIMIT 1` to get current state, but the full history of how
+Every change — the initial seed, an auto-documented table, a new audit flag, a resolved flag — is a new `INSERT` with `version = previous + 1` rather than a mutation. That makes the table double as its own audit trail: readers always `ORDER BY version DESC LIMIT 1` to get current state, but the full history of how
 the context evolved is queryable directly, in the same store as the data it
 describes, with no separate file store or vector DB to keep in sync. 
 
@@ -277,25 +264,3 @@ ORDER BY month_start ASC;
 | 2026-07-01 | $89.78 | 2 | $44.89 | 9 |
 
 
-## How to run it
-
-1. **Install Python dependenciess**: `pip install -r requirements.txt`
-2. **Copy `.env.example` to `.env`** and fill in:
-   - `CLICKHOUSE_HOST` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` (ClickHouse Cloud service)
-   - `ANTHROPIC_API_KEY` (preferred LLM provider — see `agents/config.py:AnthropicConfig`,
-     default model `claude-haiku-4-5-20251001`) or `OPENROUTER_API_KEY` (fallback if
-     Anthropic isn't set). Without either, every agent still runs, but falls back to
-     rule-based logic instead of LLM reasoning (schema generation, narrative insights,
-     context audit all degrade gracefully rather than crashing).
-   - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (optional, for tracing)
-3. **Run the pipeline**:
-
-   ```bash
-   python main.py specs/06_checkout_promo/
-   ```
-
-   This runs Context → Instrumentation → Analytics → Visualization end to end and
-   writes, into the spec directory:
-   - `generated_schema.sql` — the DDL record (tables + materialized view)
-   - `insight_summary.md` — the Analytics Agent's markdown insights
-   - `dashboard.html` — a self-contained visual dashboard
