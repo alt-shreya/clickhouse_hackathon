@@ -151,42 +151,21 @@
         <div class="glass-card">
             <span class="badge critical">critical</span>
             <div class="insight-title">Group application completion rate critically low</div>
-            <div class="insight-desc">Only 25 of 1,200 group applications submitted (2.1%); 95% drop from traveller_added to traveller_removed signals abandonment at co-traveller management.</div>
+            <div class="insight-desc">Only 25 of 1,200 group applications submitted (2.1% completion). Fix group submission funnel.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge critical">critical</span>
-            <div class="insight-title">Traveller removal churn dominates group funnel</div>
-            <div class="insight-desc">57 traveller removals across 1,200 groups; 95.25% of groups experience no removals but removers abandon at 56% rate post-removal.</div>
+            <div class="insight-title">Massive drop-off between traveller_added and group_submitted</div>
+            <div class="insight-desc">1,200 travellers added but only 25 groups submitted (97.9% drop-off). Investigate submission UX.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge critical">critical</span>
-            <div class="insight-title">Core funnel drop-off: card click to application start</div>
-            <div class="insight-desc">84.6% drop from destination_card_clicked (1M) to application_started (154K); largest leak in core funnel.</div>
-            
-        </div>
-        
-        <div class="glass-card">
-            <span class="badge critical">critical</span>
-            <div class="insight-title">Document upload is second-largest core funnel leak</div>
-            <div class="insight-desc">87.4% drop from application_started (154K) to document_uploaded (19.5K); passport capture or KYC friction is severe.</div>
-            
-        </div>
-        
-        <div class="glass-card">
-            <span class="badge critical">critical</span>
-            <div class="insight-title">Payment completion loses 82.8% of document uploads</div>
-            <div class="insight-desc">82.8% drop from document_uploaded (19.5K) to purchase_completed (3.4K); payment friction or checkout abandonment is final leak.</div>
-            
-        </div>
-        
-        <div class="glass-card">
-            <span class="badge critical">critical</span>
-            <div class="insight-title">Group submission rate drops sharply with size</div>
-            <div class="insight-desc">Groups of 6 drop 69% vs. pairs at 31% submission rate—investigate traveller coordination friction.</div>
+            <div class="insight-title">Latest week (Jun 28) shows sharp 54% drop</div>
+            <div class="insight-desc">130 purchases vs 283 prior week. Confirm data freshness; check for app version rollout (K7) or campaign end (K6).</div>
             
         </div>
         
@@ -227,43 +206,36 @@
         
         <div class="glass-card">
             <span class="badge warning">warning</span>
-            <div class="insight-title">Cannot answer: completion rate by group size</div>
-            <div class="insight-desc">Query results do not include group_size breakdown; cannot segment completion rate (group_started → group_submitted) by group size as spec requires.</div>
+            <div class="insight-title">Cannot answer group-size completion rate — no size breakdown in data</div>
+            <div class="insight-desc">Query lacks group_size segmentation. Cannot identify which group sizes convert best.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge warning">warning</span>
-            <div class="insight-title">Cannot answer: per-traveller document completion bottleneck</div>
-            <div class="insight-desc">Query results lack docs_complete flag from traveller_added; cannot determine if document readiness is the bottleneck for big groups.</div>
+            <div class="insight-title">Cannot answer per-traveller document completion bottleneck — no docs_complete data</div>
+            <div class="insight-desc">Query lacks docs_complete metric. Cannot determine if document completion blocks big groups.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge warning">warning</span>
-            <div class="insight-title">Cannot answer: destination/segment drivers for group applications</div>
-            <div class="insight-desc">Query results do not include destination or visa_type breakdown for group_started; cannot identify which destinations drive group adoption.</div>
+            <div class="insight-title">Cannot answer destination/segment drivers — no destination data in group tables</div>
+            <div class="insight-desc">Query lacks destination breakdown for group_started/submitted. Cannot identify high-intent destinations.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge warning">warning</span>
-            <div class="insight-title">Completion rate cannot be assessed by drop-off</div>
-            <div class="insight-desc">Query result shows 100% completion across all group sizes; no variation to diagnose friction points.</div>
+            <div class="insight-title">No destination-level completion variance detected</div>
+            <div class="insight-desc">Query shows 100% submission rate across all 14 destinations. Cannot identify low-performing destinations to optimize.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge warning">warning</span>
-            <div class="insight-title">Size-5 and size-6 groups show steepest cliff</div>
-            <div class="insight-desc">Submission rate falls 19.5 points from size 4 to size 5; 7.5 more points at size 6.</div>
-            
-        </div>
-        
-        <div class="glass-card">
-            <span class="badge warning">warning</span>
-            <div class="insight-title">62 size-6 groups abandoned after start</div>
-            <div class="insight-desc">90 groups initiated, 62 never submitted—largest absolute churn in cohort.</div>
+            <div class="insight-title">Weekly conversion peaked mid-May, declining into June</div>
+            <div class="insight-desc">322 purchases week-of May 10; dropped 60% to 130 by June 28. Investigate Schengen summer slot scarcity (K4) impact.</div>
             
         </div>
         
@@ -360,57 +332,92 @@
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">Group feature adoption minimal vs core funnel</div>
-            <div class="insight-desc">1,200 group starts vs 154,413 core applications (0.78%); group funnel is niche, not mainstream product flow.</div>
+            <div class="insight-title">Traveller removal minimal; not a churn driver</div>
+            <div class="insight-desc">Only 57 of 1,200 travellers removed (4.75%). Add/remove churn is negligible.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">India drives 60% of group applications</div>
-            <div class="insight-desc">726 of 1,200 group starts from India; AE (121) and SG (118) are distant second/third.</div>
+            <div class="insight-title">India dominates group applications (60.5% of starts)</div>
+            <div class="insight-desc">726 of 1,200 group_started events from India. Verify destination/segment mix.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">iOS leads group adoption but Android conversion lags</div>
-            <div class="insight-desc">iOS: 484 starts, 271 submitted (56%); Android: 395 starts, 234 submitted (59%); Desktop: 90 starts, 53 submitted (59%).</div>
+            <div class="insight-title">SG and AE show higher group submission rates than India</div>
+            <div class="insight-desc">SG: 64/118 submitted (54.2%), AE: 73/121 (60.3%), IN: 419/726 (57.7%). SG/AE more engaged.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">India dominates core funnel volume</div>
-            <div class="insight-desc">India: 559K card clicks (56%), 86.5K app starts (56%), 3.8K purchases (113% of AE); core market concentration.</div>
+            <div class="insight-title">iOS leads group application adoption</div>
+            <div class="insight-desc">484 of 1,200 group_started from iOS (40.3%). Android 32.9%, web 19.3%.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">iOS conversion outpaces Android in core funnel</div>
-            <div class="insight-desc">iOS: 63.5K app starts, 3.2K purchases (5.0% rate); Android: 49.6K app starts, 2.0K purchases (4.1% rate).</div>
+            <div class="insight-title">Group application flow newly instrumented — baseline missing</div>
+            <div class="insight-desc">group_started, traveller_added, traveller_removed, group_submitted tables are new. No historical comparison available.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">B2C funnel dominates; B2C_AFC and B2C_Black are tail</div>
-            <div class="insight-desc">B2C: 132.8K app starts (86%), 6.1K purchases (91%); B2C_AFC: 15.4K app starts (10%), 688 purchases (20% rate).</div>
+            <div class="insight-title">Thailand leads group applications with perfect submission</div>
+            <div class="insight-desc">Thailand drives 112 group starts, all 112 submitted (100% completion). Highest volume destination.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">Group completion rate perfect across all sizes</div>
-            <div class="insight-desc">100% completion rate (group_started → group_submitted) holds uniformly for groups of 2–6 travellers; no drop-off by size.</div>
+            <div class="insight-title">Malaysia and US follow Thailand in group volume</div>
+            <div class="insight-desc">Malaysia 103 starts (100% submitted), US 100 starts (100% submitted). Both destinations show perfect completion.</div>
             
         </div>
         
         <div class="glass-card">
             <span class="badge info">info</span>
-            <div class="insight-title">Largest sample: pairs (n=475)</div>
-            <div class="insight-desc">Groups of 2 dominate volume (475 groups started); completion remains 100% despite scale.</div>
+            <div class="insight-title">All top 14 destinations show 100% group submission rate</div>
+            <div class="insight-desc">Every destination in results (TH, MY, US, TR, AE, GB, EG, ID, FR, SG, GR, AU, VN, JP) converts 100% of group starts to submissions.</div>
+            
+        </div>
+        
+        <div class="glass-card">
+            <span class="badge info">info</span>
+            <div class="insight-title">iOS dominates group application starts across all destinations</div>
+            <div class="insight-desc">iOS accounts for 40–43% of group starts in top destinations (TH 48/112, MY 42/103, US 46/100). Consistent platform preference.</div>
+            
+        </div>
+        
+        <div class="glass-card">
+            <span class="badge info">info</span>
+            <div class="insight-title">Web-user-b2c represents 15–20% of group starts</div>
+            <div class="insight-desc">Web users contribute 12–23 starts per destination (TH 23/112, MY 21/103). Meaningful but smaller than mobile.</div>
+            
+        </div>
+        
+        <div class="glass-card">
+            <span class="badge info">info</span>
+            <div class="insight-title">Indonesia shows Android parity with iOS</div>
+            <div class="insight-desc">Indonesia 36 Android vs 24 iOS starts (60% Android). Only destination where Android leads or matches iOS.</div>
+            
+        </div>
+        
+        <div class="glass-card">
+            <span class="badge info">info</span>
+            <div class="insight-title">SEA destinations (TH, MY, ID, SG, VN) drive 416 of 1,200 group starts</div>
+            <div class="insight-desc">Southeast Asia accounts for 35% of group application volume. Strongest regional cluster.</div>
+            
+        </div>
+        
+        <div class="glass-card">
+            <span class="badge info">info</span>
+            <div class="insight-title">Conversion volatility high; no clear weekly pattern</div>
+            <div class="insight-desc">Weekly purchases range 130–322 (2.5x spread) over 90 days. Stabilize measurement or segment by destination/cohort.</div>
             
         </div>
         

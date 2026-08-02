@@ -12,11 +12,27 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agents.analytics.agent import AnalyticsAgent
+from agents.analytics.mcp_client import ClickHouseMCPClient
 from agents.config import get_config
 from agents.context.agent import ContextAgent
 from agents.instrumentation.agent import InstrumentationAgent
 from agents.setup import ensure_control_tables
 from main import _extract_scalar
+
+
+@st.cache_resource(show_spinner=False)
+def get_mcp_client(host: str, port: int, user: str, password: str, secure: bool, database: str):
+    """Spawn the ClickHouse MCP server subprocess once per Streamlit session and
+    reuse it across reruns/button clicks -- st.cache_resource keys on the config
+    values passed in, so a changed .env (new host/creds) still gets a fresh
+    client instead of silently reusing a stale connection. Mirrors main.py's
+    pipeline, which routes every AnalyticsAgent query through this same MCP
+    server (agents/analytics/mcp_client.py) rather than clickhouse_connect
+    directly, falling back to direct-connect only if the server can't start."""
+    from agents.config import ClickHouseConfig
+
+    ch_config = ClickHouseConfig(host=host, port=port, user=user, password=password, database=database, secure=secure)
+    return ClickHouseMCPClient.connect_or_none(ch_config)
 
 
 def normalize_schemas(payload: Any) -> Dict[str, Any]:
@@ -142,6 +158,19 @@ with st.sidebar:
         st.caption(f"Model: `{or_config.model}`")
     else:
         st.info("LLM disabled — running structural fallback")
+
+    mcp_client = None
+    if ch_config and ch_config.host:
+        with st.spinner("Connecting to ClickHouse MCP server..."):
+            mcp_client = get_mcp_client(
+                ch_config.host, ch_config.port, ch_config.user,
+                ch_config.password, ch_config.secure, ch_config.database,
+            )
+        if mcp_client is not None:
+            st.success("ClickHouse MCP server connected")
+            st.caption("Analytics Agent queries route through `mcp-clickhouse`")
+        else:
+            st.info("ClickHouse MCP unavailable — querying ClickHouse directly")
 
     st.divider()
     st.markdown("### Expected Folder Layout")
@@ -327,6 +356,7 @@ if run_clicked:
                 database=ch_config.database if ch_config else "atlys",
                 context_agent=None,
                 openrouter_config=or_config if or_config and or_config.enabled else None,
+                mcp_client=mcp_client,
             )
             question = st.session_state.get("analytics_question", "").strip()
             pm_questions = [question] if question else None
@@ -377,6 +407,7 @@ if "schemas" in st.session_state or "insights" in st.session_state:
                         database=ch_config.database if ch_config else "atlys",
                         context_agent=None,
                         openrouter_config=or_config if or_config and or_config.enabled else None,
+                        mcp_client=mcp_client,
                     )
                     spec_name = spec_option or (effective_spec_path.name if effective_spec_path else "")
                     insights = aa.run_full_analysis(

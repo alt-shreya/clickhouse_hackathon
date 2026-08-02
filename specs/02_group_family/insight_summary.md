@@ -103,122 +103,128 @@ Sequential funnel over group_started, traveller_added, traveller_removed, group_
 **Value:** 56.14035087719298  
 
 ## Group application completion rate critically low [CRITICAL]
-Only 25 of 1,200 group applications submitted (2.1%); 95% drop from traveller_added to traveller_removed signals abandonment at co-traveller management.
+Only 25 of 1,200 group applications submitted (2.1% completion). Fix group submission funnel.
 
-**Metric:** group_started → group_submitted completion rate  
+**Metric:** group_started → group_submitted completion  
 **Value:** 2.1%  
 
-## Traveller removal churn dominates group funnel [CRITICAL]
-57 traveller removals across 1,200 groups; 95.25% of groups experience no removals but removers abandon at 56% rate post-removal.
+## Massive drop-off between traveller_added and group_submitted [CRITICAL]
+1,200 travellers added but only 25 groups submitted (97.9% drop-off). Investigate submission UX.
 
-**Metric:** traveller_removed → group_submitted drop-off  
-**Value:** 56.1%  
+**Metric:** traveller_added → group_submitted drop-off  
+**Value:** 97.9%  
 
-## Group feature adoption minimal vs core funnel [INFO]
-1,200 group starts vs 154,413 core applications (0.78%); group funnel is niche, not mainstream product flow.
+## Traveller removal minimal; not a churn driver [INFO]
+Only 57 of 1,200 travellers removed (4.75%). Add/remove churn is negligible.
 
-**Metric:** group_started / application_started ratio  
-**Value:** 0.78%  
+**Metric:** traveller_removed / traveller_added  
+**Value:** 4.75%  
 
-## India drives 60% of group applications [INFO]
-726 of 1,200 group starts from India; AE (121) and SG (118) are distant second/third.
-
-**Metric:** group_started by geoip_country_code  
-**Value:** 60.5% IN  
-
-## iOS leads group adoption but Android conversion lags [INFO]
-iOS: 484 starts, 271 submitted (56%); Android: 395 starts, 234 submitted (59%); Desktop: 90 starts, 53 submitted (59%).
-
-**Metric:** group_started → group_submitted by device_type  
-**Value:** iOS 56%, Android 59%, Desktop 59%  
-
-## Cannot answer: completion rate by group size [WARNING]
-Query results do not include group_size breakdown; cannot segment completion rate (group_started → group_submitted) by group size as spec requires.
+## Cannot answer group-size completion rate — no size breakdown in data [WARNING]
+Query lacks group_size segmentation. Cannot identify which group sizes convert best.
 
 **Metric:** group_size completion rate  
 **Value:** N/A  
 
-## Cannot answer: per-traveller document completion bottleneck [WARNING]
-Query results lack docs_complete flag from traveller_added; cannot determine if document readiness is the bottleneck for big groups.
+## Cannot answer per-traveller document completion bottleneck — no docs_complete data [WARNING]
+Query lacks docs_complete metric. Cannot determine if document completion blocks big groups.
 
 **Metric:** docs_complete by group_size  
 **Value:** N/A  
 
-## Cannot answer: destination/segment drivers for group applications [WARNING]
-Query results do not include destination or visa_type breakdown for group_started; cannot identify which destinations drive group adoption.
+## India dominates group applications (60.5% of starts) [INFO]
+726 of 1,200 group_started events from India. Verify destination/segment mix.
 
-**Metric:** group_started by destination  
+**Metric:** group_started by geoip_country_code  
+**Value:** IN: 60.5%  
+
+## SG and AE show higher group submission rates than India [INFO]
+SG: 64/118 submitted (54.2%), AE: 73/121 (60.3%), IN: 419/726 (57.7%). SG/AE more engaged.
+
+**Metric:** group_submitted / group_started by geo  
+**Value:** SG 54.2%, AE 60.3%, IN 57.7%  
+
+## iOS leads group application adoption [INFO]
+484 of 1,200 group_started from iOS (40.3%). Android 32.9%, web 19.3%.
+
+**Metric:** group_started by device_type  
+**Value:** iOS 40.3%  
+
+## Cannot answer destination/segment drivers — no destination data in group tables [WARNING]
+Query lacks destination breakdown for group_started/submitted. Cannot identify high-intent destinations.
+
+**Metric:** group_submitted by destination  
 **Value:** N/A  
 
-## Core funnel drop-off: card click to application start [CRITICAL]
-84.6% drop from destination_card_clicked (1M) to application_started (154K); largest leak in core funnel.
+## Group application flow newly instrumented — baseline missing [INFO]
+group_started, traveller_added, traveller_removed, group_submitted tables are new. No historical comparison available.
 
-**Metric:** destination_card_clicked → application_started drop-off  
-**Value:** 84.6%  
+**Metric:** group_application instrumentation  
+**Value:** newly_added  
 
-## Document upload is second-largest core funnel leak [CRITICAL]
-87.4% drop from application_started (154K) to document_uploaded (19.5K); passport capture or KYC friction is severe.
+## Thailand leads group applications with perfect submission [INFO]
+Thailand drives 112 group starts, all 112 submitted (100% completion). Highest volume destination.
 
-**Metric:** application_started → document_uploaded drop-off  
-**Value:** 87.4%  
+**Metric:** group_applications_started  
+**Value:** 112  
 
-## Payment completion loses 82.8% of document uploads [CRITICAL]
-82.8% drop from document_uploaded (19.5K) to purchase_completed (3.4K); payment friction or checkout abandonment is final leak.
+## Malaysia and US follow Thailand in group volume [INFO]
+Malaysia 103 starts (100% submitted), US 100 starts (100% submitted). Both destinations show perfect completion.
 
-**Metric:** document_uploaded → purchase_completed drop-off  
-**Value:** 82.8%  
+**Metric:** group_applications_started  
+**Value:** 103–100  
 
-## India dominates core funnel volume [INFO]
-India: 559K card clicks (56%), 86.5K app starts (56%), 3.8K purchases (113% of AE); core market concentration.
+## All top 14 destinations show 100% group submission rate [INFO]
+Every destination in results (TH, MY, US, TR, AE, GB, EG, ID, FR, SG, GR, AU, VN, JP) converts 100% of group starts to submissions.
 
-**Metric:** core funnel by geoip_country_code  
-**Value:** IN 56% card clicks, 56% app starts  
+**Metric:** submission_rate_pct  
+**Value:** 100.0  
 
-## iOS conversion outpaces Android in core funnel [INFO]
-iOS: 63.5K app starts, 3.2K purchases (5.0% rate); Android: 49.6K app starts, 2.0K purchases (4.1% rate).
+## iOS dominates group application starts across all destinations [INFO]
+iOS accounts for 40–43% of group starts in top destinations (TH 48/112, MY 42/103, US 46/100). Consistent platform preference.
 
-**Metric:** application_started → purchase_completed by device_type  
-**Value:** iOS 5.0%, Android 4.1%  
+**Metric:** ios_starts_pct  
+**Value:** 40–43%  
 
-## B2C funnel dominates; B2C_AFC and B2C_Black are tail [INFO]
-B2C: 132.8K app starts (86%), 6.1K purchases (91%); B2C_AFC: 15.4K app starts (10%), 688 purchases (20% rate).
+## Web-user-b2c represents 15–20% of group starts [INFO]
+Web users contribute 12–23 starts per destination (TH 23/112, MY 21/103). Meaningful but smaller than mobile.
 
-**Metric:** application_started → purchase_completed by funnel_type  
-**Value:** B2C 86% volume, 91% purchases  
+**Metric:** web_starts_pct  
+**Value:** 15–20%  
 
-## Group completion rate perfect across all sizes [INFO]
-100% completion rate (group_started → group_submitted) holds uniformly for groups of 2–6 travellers; no drop-off by size.
+## Indonesia shows Android parity with iOS [INFO]
+Indonesia 36 Android vs 24 iOS starts (60% Android). Only destination where Android leads or matches iOS.
 
-**Metric:** group_completion_rate_by_size  
-**Value:** 100% (all cohorts)  
+**Metric:** android_starts  
+**Value:** 36  
 
-## Largest sample: pairs (n=475) [INFO]
-Groups of 2 dominate volume (475 groups started); completion remains 100% despite scale.
+## SEA destinations (TH, MY, ID, SG, VN) drive 416 of 1,200 group starts [INFO]
+Southeast Asia accounts for 35% of group application volume. Strongest regional cluster.
 
-**Metric:** groups_started_by_size  
-**Value:** 475 (size 2)  
+**Metric:** group_applications_started  
+**Value:** 416  
 
-## Completion rate cannot be assessed by drop-off [WARNING]
-Query result shows 100% completion across all group sizes; no variation to diagnose friction points.
+## No destination-level completion variance detected [WARNING]
+Query shows 100% submission rate across all 14 destinations. Cannot identify low-performing destinations to optimize.
 
-**Metric:** group_completion_rate_by_size  
-**Value:** 100% (all cohorts)  
+**Metric:** submission_rate_pct  
+**Value:** 100.0  
 
-## Group submission rate drops sharply with size [CRITICAL]
-Groups of 6 drop 69% vs. pairs at 31% submission rate—investigate traveller coordination friction.
+## Weekly conversion peaked mid-May, declining into June [WARNING]
+322 purchases week-of May 10; dropped 60% to 130 by June 28. Investigate Schengen summer slot scarcity (K4) impact.
 
-**Metric:** submission_rate_pct by group_size  
-**Value:** 31.11% (size 6) vs. 69.47% (size 2)  
+**Metric:** weekly_purchases  
+**Value:** 322 → 130 (−60%)  
 
-## Size-5 and size-6 groups show steepest cliff [WARNING]
-Submission rate falls 19.5 points from size 4 to size 5; 7.5 more points at size 6.
+## Conversion volatility high; no clear weekly pattern [INFO]
+Weekly purchases range 130–322 (2.5x spread) over 90 days. Stabilize measurement or segment by destination/cohort.
 
-**Metric:** submission_rate_pct delta  
-**Value:** 50.42% → 38.6% → 31.11%  
+**Metric:** weekly_purchase_variance  
+**Value:** 130–322 purchases/week  
 
-## 62 size-6 groups abandoned after start [WARNING]
-90 groups initiated, 62 never submitted—largest absolute churn in cohort.
+## Latest week (Jun 28) shows sharp 54% drop [CRITICAL]
+130 purchases vs 283 prior week. Confirm data freshness; check for app version rollout (K7) or campaign end (K6).
 
-**Metric:** groups_dropped  
-**Value:** 62 of 90 (size 6)  
+**Metric:** week_over_week_change  
+**Value:** −54% (283 → 130)  
 
