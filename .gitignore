@@ -4,3 +4,4 @@ agents/__pycache__/**/*
 specs/
 data/
 __pycache__
+agents/.pytest_cache/
