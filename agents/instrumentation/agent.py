@@ -121,7 +121,7 @@ class TableSchema:
         
         nl = "\n"
         comma_nl = ",\n"
-        ddl = f"CREATE TABLE {database}.{self.name}\n(\n{comma_nl.join(cols)}\n)\n"
+        ddl = f"CREATE TABLE IF NOT EXISTS {database}.{self.name}\n(\n{comma_nl.join(cols)}\n)\n"
         ddl += f"ENGINE = {self.engine}"
         if self.partition_by:
             ddl += f"\nPARTITION BY {self.partition_by}"
@@ -998,7 +998,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
         return (
             f"-- Daily {', '.join(segment_cols)} rollup for {schema.name}: event count + "
             f"unique users, pre-aggregated so AnalyticsAgent's segment cuts don't rescan raw events.\n"
-            f"CREATE MATERIALIZED VIEW {self.database}.{mv_name}\n"
+            f"CREATE MATERIALIZED VIEW IF NOT EXISTS {self.database}.{mv_name}\n"
             f"ENGINE = AggregatingMergeTree\n"
             f"ORDER BY (day, {segment_select})\n"
             f"{settings_clause}"

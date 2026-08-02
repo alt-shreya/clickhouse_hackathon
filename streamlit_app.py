@@ -17,7 +17,7 @@ from agents.config import get_config
 from agents.context.agent import ContextAgent
 from agents.instrumentation.agent import InstrumentationAgent
 from agents.setup import ensure_control_tables
-from main import _extract_scalar
+from main import _default_for_column, _flatten_event_row
 
 
 @st.cache_resource(show_spinner=False)
@@ -321,10 +321,7 @@ if run_clicked:
                         event_data = json.loads(line)
                         event_type = event_data.get("event", "unknown_event")
                         table_name = event_type.lower().replace("-", "_")
-                        sanitized = {
-                            k: _extract_scalar(v) for k, v in event_data.items()
-                        }
-                        records_by_table[table_name].append(sanitized)
+                        records_by_table[table_name].append(_flatten_event_row(event_data))
 
                 for table_name, records in records_by_table.items():
                     if (
@@ -335,10 +332,15 @@ if run_clicked:
                         try:
                             schema = st.session_state["schemas"][table_name]
                             col_names = [c.name for c in schema.columns]
-                            rows = [
-                                tuple(r.get(c, None) for c in col_names)
-                                for r in records
-                            ]
+                            rows = []
+                            for r in records:
+                                row_values = []
+                                for col in schema.columns:
+                                    value = r.get(col.name)
+                                    if value is None and not col.nullable:
+                                        value = _default_for_column(col)
+                                    row_values.append(value)
+                                rows.append(tuple(row_values))
                             ch_client.insert(
                                 f"{ch_config.database}.{table_name}",
                                 rows,
@@ -409,11 +411,12 @@ if "schemas" in st.session_state or "insights" in st.session_state:
                         openrouter_config=or_config if or_config and or_config.enabled else None,
                         mcp_client=mcp_client,
                     )
-                    spec_name = spec_option or (effective_spec_path.name if effective_spec_path else "")
-                    insights = aa.run_full_analysis(
-                        pm_questions=[prompt],
-                        spec_name=spec_name,
-                    )
+                    # Mirrors the CLI's interactive "ask" flow (handle_insight_request):
+                    # question -> SQL -> narrative insight grounded only in that query's
+                    # rows. run_full_analysis() instead prepends the generic core-funnel/
+                    # drop-off/segment dump before the question's own answer, and the [:6]
+                    # slice below never reached the actual answer.
+                    insights = aa.handle_insight_request(prompt)
                     st.session_state["insights"] = insights
 
         if "insights" in st.session_state and st.session_state["insights"]:
@@ -423,6 +426,7 @@ if "schemas" in st.session_state or "insights" in st.session_state:
             for insight in insights:
                 sev = getattr(insight, "severity", "info").lower()
                 title = getattr(insight, "title", "Insight")
+                description = getattr(insight, "description", "")
                 metric = getattr(insight, "metric", "N/A")
                 value = getattr(insight, "value", "N/A")
 
@@ -433,8 +437,9 @@ if "schemas" in st.session_state or "insights" in st.session_state:
                 else:
                     st.info(f"### {title}")
 
-                st.caption(f"**Metric:** `{metric}`")
-                st.caption(f"**Value:** `{value}`")
+                if description:
+                    st.markdown(description)
+                st.caption(f"**Metric:** `{metric}` &nbsp;·&nbsp; **Value:** `{value}`")
         else:
             st.info("Ask a question to start the analytics insight cards.")
 
