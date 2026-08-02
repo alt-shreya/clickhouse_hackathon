@@ -108,63 +108,51 @@ Sequential funnel over express_checkout_shown, express_checkout_selected, saved_
 **Metric:** spec_drop_off_rate  
 **Value:** 16.9811320754717  
 
-## Express checkout adoption strong but show-to-select gap [WARNING]
-39% of users shown Express checkout drop off before selecting it; 1,650 shown, 1,007 selected.
+## Express payment confirmation now 83% — critical recovery from K1 [INFO]
+836 of 1,007 OTP users confirmed payment (83% vs 0% in K1). Express checkout funnel restored; K1 issue resolved.
 
-**Metric:** express_checkout_shown → express_checkout_selected drop-off  
-**Value:** 38.97%  
+**Metric:** otp_entered → express_payment_confirmed  
+**Value:** 83.0%  
 
-## Express payment OTP-to-confirm drop-off at 17% [WARNING]
-170 of 1,007 users fail to confirm after entering OTP; 17% abandonment at final step.
+## Express adoption 61% — 39% abandon at selection step [WARNING]
+1,007 of 1,650 shown Express selected it (61% adoption). 643 users drop before payment entry.
 
-**Metric:** otp_entered → express_payment_confirmed drop-off  
-**Value:** 16.98%  
+**Metric:** express_checkout_selected / express_checkout_shown  
+**Value:** 61.0%  
 
-## Express checkout conversion: 836 of 1,650 shown (50.6%) [INFO]
-Express payment confirmed for 50.6% of users shown Express; baseline core funnel is 2.2% (3,366 / 154,413 app starters).
+## iOS 74% OTP success vs Android 90% — iOS underperforms [WARNING]
+iOS: 316/428 confirmed (74%). Android: 303/338 confirmed (90%). iOS OTP conversion 16 points lower.
 
-**Metric:** express_payment_confirmed / express_checkout_shown  
-**Value:** 50.6%  
+**Metric:** otp_success_rate by device  
+**Value:** iOS 74% vs Android 90%  
 
-## iOS Express adoption leads Android by 4 points [INFO]
-iOS: 316/702 shown = 45% confirmed. Android: 303/538 shown = 56% confirmed. Android outperforms iOS.
+## India 84% Express selection but SG/AE show 64%/57% — geo intent gap [INFO]
+IN: 606/1,007 selected (60% of pool, 60% selection). SG: 94/147 (64% selection). AE: 88/153 (57%). India underconverts vs intent.
 
-**Metric:** express_payment_confirmed by device_type  
-**Value:** iOS 45%, Android 56%  
+**Metric:** express_checkout_selected by geo  
+**Value:** IN 60% vs SG 64% vs AE 57%  
 
-## India dominates Express volume but lower conversion [INFO]
-509 of 1,007 Express users (50.5%) are India; 509/1,007 confirmed = 50.5% vs SG 71/147 = 48.3%.
+## Cannot measure Express vs standard checkout lift — no baseline [WARNING]
+Query lacks standard checkout funnel. Cannot compute conversion lift or answer spec Q1.
 
-**Metric:** express_payment_confirmed by geoip_country_code  
-**Value:** IN: 509/1,007 (50.5%)  
-
-## No OTP success/failure split in query results [WARNING]
-Cannot answer whether OTP fails more on iOS vs Android; otp_entered shows 1,007 events but no failure column.
-
-**Metric:** otp_success by platform  
+**Metric:** standard_checkout funnel  
 **Value:** N/A  
 
-## No payment latency data in query results [WARNING]
-Cannot measure Express speed vs standard checkout; payment.latency_ms not present in spec_analysis.
+## Cannot measure Express payment latency — no timing data [WARNING]
+Query lacks payment.latency_ms or time-to-confirmation. Cannot answer spec Q3 (speed comparison).
 
-**Metric:** payment.latency_ms (Express vs Standard)  
+**Metric:** payment.latency_ms  
 **Value:** N/A  
 
-## No standard checkout baseline for comparison [CRITICAL]
-Cannot compute Express lift vs standard checkout; standard checkout funnel not in query results.
+## Web-user-b2c 92% OTP success — highest platform confidence [INFO]
+Web: 170/185 confirmed (92% success). Desktop: 47/56 (84%). Mobile lags web by 8–18 points.
 
-**Metric:** Express vs Standard checkout conversion lift  
-**Value:** N/A  
+**Metric:** otp_success_rate by device  
+**Value:** Web 92% vs iOS 74% vs Android 90%  
 
-## Saved method adoption 100% among Express users [INFO]
-All 1,007 users who selected Express used a saved payment method; no drop-off between selection and saved_method_used.
+## SG Express users 64% selection rate — highest geo intent [INFO]
+SG: 94/147 selected (64%). Outperforms IN (60%), AE (57%), US (62%). SG most ready for Express.
 
-**Metric:** saved_method_used / express_checkout_selected  
-**Value:** 100%  
-
-## Web-user-b2c Express adoption lags mobile [INFO]
-Web: 170/318 shown = 53% confirmed. iOS: 316/702 = 45%. Desktop: 47/92 = 51%.
-
-**Metric:** express_payment_confirmed by device_type (web-user-b2c)  
-**Value:** 53%  
+**Metric:** express_checkout_selected / express_checkout_shown by geo  
+**Value:** SG 64%  
 

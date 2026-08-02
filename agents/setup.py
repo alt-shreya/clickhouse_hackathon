@@ -33,17 +33,28 @@ def ensure_control_tables(client) -> None:
             updated_at DateTime DEFAULT now()
         )
         ENGINE = ReplacingMergeTree(version)
-        ORDER BY (doc_id)
+        ORDER BY (doc_id, version)
     """)
-    # ReplacingMergeTree(version) only -- deliberately WITHOUT the optional
-    # is_deleted parameter. agents/setup.py (the old meta_context_registry
-    # table) already documents the footgun this avoids: binding a table's
-    # "current" semantics to ReplacingMergeTree's is_deleted purges the WHOLE
-    # duplicate-key group on merge, not just the losing rows. Every read here
-    # goes through ContextAgent._latest_doc()'s `ORDER BY version DESC LIMIT 1`
-    # rather than relying on merge-time dedup anyway, so this table only needs
-    # ReplacingMergeTree to eventually collapse old versions for storage, never
-    # to decide correctness.
+    # ORDER BY (doc_id, version) -- version is part of the sorting/dedup key,
+    # not just the ReplacingMergeTree version argument. Every ContextAgent
+    # write (update_context/run_audit/resolve_flag/add_analytical_findings)
+    # already only ever INSERTs a new row with the next version rather than
+    # mutating one in place -- that's the audit trail -- but a prior version of
+    # this table had ORDER BY (doc_id) alone, so ReplacingMergeTree's
+    # background merges would eventually collapse ALL of a doc_id's version
+    # rows down to just the newest one (that's what the version argument to
+    # ReplacingMergeTree does: keep the max-version row per duplicate-key
+    # group), silently deleting the very history those inserts were meant to
+    # preserve. Including version in the key means only exact (doc_id, version)
+    # duplicates -- e.g. the same version genuinely inserted twice -- ever get
+    # collapsed; distinct versions are permanently distinct rows. Matches the
+    # same fix already applied to meta_context_registry below (ORDER BY
+    # includes `version`) for the identical reason.
+    #
+    # ReplacingMergeTree(version) is deliberately WITHOUT the optional
+    # is_deleted parameter -- see meta_context_registry's comment below for
+    # the footgun that avoids (purging a whole duplicate-key group on merge,
+    # not just the losing rows).
 
     client.command("""
         CREATE TABLE IF NOT EXISTS atlys.meta_context_registry

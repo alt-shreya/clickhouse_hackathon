@@ -11,6 +11,7 @@ from agents.setup import ensure_control_tables, is_business_context_seeded
 from agents.context.agent import ContextAgent
 from agents.instrumentation.agent import InstrumentationAgent
 from agents.analytics.agent import AnalyticsAgent
+from agents.analytics.mcp_client import ClickHouseMCPClient
 from agents.tracing.agent import get_tracer
 from agents.visualization.dashboard_builder import DashboardBuilder
 import dataclasses
@@ -121,24 +122,23 @@ def _flatten_event_row(row: dict) -> dict:
             flattened[key] = _parse_event_id(value)
             continue
         if isinstance(value, dict):
+            # Prefix with the parent key (e.g. "payment": {"amount": ...} ->
+            # "payment_amount") rather than hoisting sub-keys unprefixed. A
+            # prior version dropped the parent key entirely and then
+            # hand-remapped "amount"/"currency" to "value"/"currency" as a
+            # special case for the express_payment_confirmed event alone --
+            # but that remap target didn't match this spec's actual generated
+            # schema (payment_amount/payment_currency/payment_latency_ms), so
+            # every insert into that table failed on an unrecognized column.
+            # Prefixing generically matches whatever naming convention the
+            # schema-generation LLM already uses for a nested payload (it
+            # names columns after the source object), for any event with a
+            # nested field, not just this one.
             for sub_key, sub_value in value.items():
-                flattened[sub_key] = _extract_scalar(sub_value)
+                flattened[f"{key}_{sub_key}"] = _extract_scalar(sub_value)
             continue
         flattened[key] = _extract_scalar(value)
     return flattened
-
-
-def _map_row_to_schema(event_name: str, row: dict) -> dict:
-    mapped = _flatten_event_row(row)
-    if event_name == "express_payment_confirmed":
-        payment = row.get("payment", {}) if isinstance(row.get("payment"), dict) else {}
-        mapped["value"] = payment.get("amount")
-        mapped["currency"] = payment.get("currency")
-        mapped["insurance_amount"] = payment.get("insurance_amount")
-        mapped["coupon_applied"] = payment.get("coupon_applied")
-        mapped.pop("amount", None)
-        mapped.pop("latency_ms", None)
-    return mapped
 
 
 def _event_to_table(row: dict) -> str | None:
@@ -262,7 +262,7 @@ def run_pipeline(spec_dir: str):
                         if not table_name or table_name not in ia.schemas:
                             missing_tables[table_name or "<unknown>"] += 1
                             continue
-                        events_by_table[table_name].append(_map_row_to_schema(table_name, data))
+                        events_by_table[table_name].append(_flatten_event_row(data))
 
                 for table, rows in events_by_table.items():
                     if not rows:
@@ -299,34 +299,43 @@ def run_pipeline(spec_dir: str):
                         print(f"    - {table_name}: {count} rows")
         _log("instrumentation", f"Instrumentation Agent done -- {len(schemas)} table(s), {len(ia.materialized_views)} MV(s)", stage_t0)
 
-        # 4. Run AnalyticsAgent
+        # 4. Run AnalyticsAgent -- queries ClickHouse through the ClickHouse MCP
+        # server (agents/analytics/mcp_client.py) when it's available, falling
+        # back to the direct clickhouse_connect client otherwise.
         stage_t0 = time.monotonic()
         _log("analytics", "Running Analytics Agent...")
-        with tracer.trace_span("pipeline.analytics"):
-            aa = AnalyticsAgent(
-                client=client,
-                database=ch_config.database,
-                context_agent=ca,
-                openrouter_config=or_config
-            )
-            spec_tables = list(ia.schemas.keys())
-            spec_name = ia.last_analysis.feature_name if ia.last_analysis else spec_path.name
-            pm_questions = _extract_pm_questions(ia.last_analysis.raw_spec_md) if ia.last_analysis else []
-            insights = aa.run_full_analysis(spec_tables=spec_tables, pm_questions=pm_questions, spec_name=spec_name)
-            md_out = spec_path / "insight_summary.md"
-            aa.export_insights(md_out, format="markdown")
-            print(f"  Saved {len(insights)} insights to {md_out}")
-        _log("analytics", f"Analytics Agent done -- {len(insights)} insight(s)", stage_t0)
+        mcp_client = ClickHouseMCPClient.connect_or_none(ch_config)
+        _log("analytics", f"ClickHouse MCP {'connected' if mcp_client else 'unavailable -- querying ClickHouse directly'}")
+        try:
+            with tracer.trace_span("pipeline.analytics"):
+                aa = AnalyticsAgent(
+                    client=client,
+                    database=ch_config.database,
+                    context_agent=ca,
+                    openrouter_config=or_config,
+                    mcp_client=mcp_client,
+                )
+                spec_tables = list(ia.schemas.keys())
+                spec_name = ia.last_analysis.feature_name if ia.last_analysis else spec_path.name
+                pm_questions = _extract_pm_questions(ia.last_analysis.raw_spec_md) if ia.last_analysis else []
+                insights = aa.run_full_analysis(spec_tables=spec_tables, pm_questions=pm_questions, spec_name=spec_name)
+                md_out = spec_path / "insight_summary.md"
+                aa.export_insights(md_out, format="markdown")
+                print(f"  Saved {len(insights)} insights to {md_out}")
+            _log("analytics", f"Analytics Agent done -- {len(insights)} insight(s)", stage_t0)
 
-        # 4.5 Interactive Q&A -- only when run from a real terminal. Guarded on
-        # isatty() so pytest/CI (piped/redirected stdin) never blocks forever
-        # on input(); a human running `python main.py specs/...` directly gets
-        # prompted for their own analytics questions before the dashboard is built.
-        if sys.stdin.isatty():
-            with tracer.trace_span("pipeline.analytics.interactive"):
-                aa.run_interactive()
-            aa.export_insights(md_out, format="markdown")
-            print(f"  Re-saved {len(insights)} insight(s) (including interactive ones) to {md_out}")
+            # 4.5 Interactive Q&A -- only when run from a real terminal. Guarded on
+            # isatty() so pytest/CI (piped/redirected stdin) never blocks forever
+            # on input(); a human running `python main.py specs/...` directly gets
+            # prompted for their own analytics questions before the dashboard is built.
+            if sys.stdin.isatty():
+                with tracer.trace_span("pipeline.analytics.interactive"):
+                    aa.run_interactive()
+                aa.export_insights(md_out, format="markdown")
+                print(f"  Re-saved {len(insights)} insight(s) (including interactive ones) to {md_out}")
+        finally:
+            if mcp_client is not None:
+                mcp_client.close()
 
         # 5. Build the dashboard
         stage_t0 = time.monotonic()

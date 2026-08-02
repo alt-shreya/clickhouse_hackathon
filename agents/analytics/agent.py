@@ -237,7 +237,7 @@ class AnalyticsAgent:
     # of legitimate rows -- see handle_insight_request()'s "narrow it" hint.
     _BROAD_RESULT_HINT_THRESHOLD = 150
 
-    def __init__(self, client, database: str, context_agent=None, openrouter_config=None):
+    def __init__(self, client, database: str, context_agent=None, openrouter_config=None, mcp_client=None):
         self.client = client
         self.database = database
         self.context_agent = context_agent
@@ -248,10 +248,19 @@ class AnalyticsAgent:
         if openrouter_config and openrouter_config.enabled:
             self._llm_client = openrouter_config.get_client()
 
+        # When set (see main.py's analytics stage), every ClickHouse read this
+        # agent makes goes through the ClickHouse MCP server instead of the
+        # clickhouse_connect client directly -- `client` is still kept around as
+        # the fallback for standalone/test usage that doesn't wire an MCP client up.
+        self.mcp_client = mcp_client
+
     def run_query(self, query: str) -> List[Dict]:
         """Execute a query and return results as list of dicts. This is the one
         place any agent code -- deterministic or LLM-generated -- actually talks
-        to ClickHouse."""
+        to ClickHouse (via the ClickHouse MCP server when configured, otherwise
+        directly through clickhouse_connect)."""
+        if self.mcp_client is not None:
+            return self.mcp_client.run_select_query(query)
         result = self.client.query(query)
         columns = result.column_names
         return [dict(zip(columns, row)) for row in result.result_rows]
@@ -653,9 +662,9 @@ Return only the SQL statement."""
             GROUP BY {id_column}
         )
         """
-        result = self.client.query(query)
-        row = result.result_rows[0] if result.result_rows else [0] * len(steps)
-        return dict(zip(steps, row))
+        rows = self.run_query(query)
+        row = rows[0] if rows else {f"step_{i + 1}": 0 for i in range(len(steps))}
+        return {step: row.get(f"step_{i + 1}", 0) for i, step in enumerate(steps)}
 
     def get_funnel_metrics(self) -> Dict[str, Any]:
         """Sequential funnel over the 4 core pre-purchase steps."""
@@ -1006,6 +1015,7 @@ if __name__ == "__main__":
     import clickhouse_connect
     from agents.config import get_config, make_llm_call_fn
     from agents.context.agent import ContextAgent
+    from agents.analytics.mcp_client import ClickHouseMCPClient
 
     ch_config, lf_config, or_config = get_config()
     client = clickhouse_connect.get_client(
@@ -1021,10 +1031,16 @@ if __name__ == "__main__":
     if or_config.enabled:
         context_agent = ContextAgent(client=client, llm_call_fn=make_llm_call_fn(or_config))
 
-    agent = AnalyticsAgent(
-        client=client,
-        database=ch_config.database,
-        context_agent=context_agent,
-        openrouter_config=or_config,
-    )
-    agent.run_interactive()
+    mcp_client = ClickHouseMCPClient.connect_or_none(ch_config)
+    try:
+        agent = AnalyticsAgent(
+            client=client,
+            database=ch_config.database,
+            context_agent=context_agent,
+            openrouter_config=or_config,
+            mcp_client=mcp_client,
+        )
+        agent.run_interactive()
+    finally:
+        if mcp_client is not None:
+            mcp_client.close()

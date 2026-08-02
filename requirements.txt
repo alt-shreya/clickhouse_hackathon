@@ -16,6 +16,12 @@ langfuse>=2.53.0
 # Core
 clickhouse-connect>=1.6.0
 
+# ClickHouse MCP -- AnalyticsAgent talks to ClickHouse through the official
+# ClickHouse MCP server (agents/analytics/mcp_client.py) when it's installed,
+# falling back to clickhouse-connect directly otherwise.
+mcp>=1.2.0
+mcp-clickhouse>=0.1.8
+
 # LLM (OpenRouter - OpenAI compatible; fallback provider)
 openai>=1.0.0
 
