@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agents.analytics.agent import AnalyticsAgent
 from agents.context.agent import ContextAgent
+from agents.context.load_base_context import build_seed_content
 
 
 def test_run_pipeline_with_real_context_agent():
@@ -27,19 +28,20 @@ def test_run_pipeline_with_real_context_agent():
     # 3. Initialize the REAL ContextAgent using its true constructor signature
     context_agent = ContextAgent(client=mock_client, llm_call_fn=mock_llm_call)
 
-    # Mock the return value of get_latest_context so AnalyticsAgent gets the
-    # data structure it expects: the unified business-context document.
-    context_agent.get_latest_context = MagicMock(return_value={
+    # Mock _latest_doc() -- the actual read implementation both
+    # get_latest_context() and add_analytical_findings() call through to --
+    # rather than get_latest_context() alone, so both entry points see
+    # consistent data. Uses the real build_seed_content() (not a hand-rolled
+    # snippet) so the section markers add_analytical_findings() needs to
+    # splice into are actually present.
+    context_agent._latest_doc = MagicMock(return_value={
         "doc_id": "atlys_base_context",
-        "content": (
-            "## 5. Known-issues log\n\n"
-            "1. **K1** -- New OTP verification introduces a 2s latency spike on mobile web, "
-            "causing drop-offs on `purchase_completed`.\n"
-        ),
+        "content": build_seed_content(),
         "version": 1,
         "changelog_summary": "Initial seed from base_context.md",
         "updated_at": None,
     })
+    context_agent.get_latest_context = MagicMock(side_effect=context_agent.get_latest_context)
 
     # 4. Mock LLM Config for AnalyticsAgent
     openrouter_config = MagicMock()

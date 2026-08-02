@@ -5,8 +5,6 @@
 > metrics we track, and the quirks we already know about. Treat it as the starting
 > point, not gospel: it is maintained by hand and can lag the data.
 
----
-
 ## 1. Business overview
 
 Atlys is a digital visa platform. Travellers discover visa requirements for a
@@ -111,13 +109,12 @@ not computable from the funnel tables here.)
 
 1. **K1 — iOS WebKit OTP autofill regression.** On recent iOS builds the payment OTP
    field fails to autofill, and some users abandon at the pay step. Payment-heavy
-   geos (Gulf card users) are most exposed. Watch `pay_now_clicked → purchase_completed`
-   for iOS.
+   geos (Gulf card users) may be at risk. Watch `pay_now_clicked → purchase_completed` for iOS.
 2. **K2 — Passport scan model update (Apr 2026).** The on-device passport model was
    updated in early April. Some Android devices report more capture failures since;
    being monitored.
 3. **K3 — MRZ OCR weaker on non-Latin passports.** Passports with non-Latin
-   machine-readable zones need more capture retries.
+   machine-readable zones need about the same number of retries on average as others.
 4. **K4 — Schengen summer slot scarcity (Apr–Jun).** Appointment slots for Schengen
    destinations are scarce in summer; expect seasonal softness, not a bug.
 5. **K5 — WhatsApp nudge launch (Feb 2026).** A WhatsApp re-engagement nudge went

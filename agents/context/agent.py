@@ -4,14 +4,22 @@ ContextAgent -- the single object every other agent talks to for context.
 Business context is ONE whole Markdown document, not decomposed into rows.
 It lives in analytics_context.business_context (doc_id, content, version,
 changelog_summary, updated_at), a ReplacingMergeTree keyed on doc_id: every
-change -- the initial seed, a new table being auto-documented, an audit
-finding a flag, a flag being resolved -- INSERTs a new version rather than
-mutating any row in place, so the table doubles as the full audit trail.
-Callers always read the latest version and inject `content` directly into
-their prompts; there is no per-row filtering to do because the document is
-the atomic unit.
+change -- the initial seed, new tables being documented, an audit finding a
+flag, a flag being resolved, AnalyticsAgent recording a batch of findings --
+INSERTs a new version rather than mutating any row in place, so the table
+doubles as the full audit trail. Callers always read the latest version and
+inject `content` directly into their prompts; there is no per-row filtering to
+do because the document is the atomic unit.
 
-Fixed interface: load_v1, get_latest_context, update_context, run_audit, resolve_flag.
+New tables are appended as rows to Section 3's existing table catalog (not a
+separate section); AnalyticsAgent's findings land in their own Section 10.
+Both update_context() and add_analytical_findings() are meant to be called
+ONCE per batch of work (once per spec's tables, once per analysis run) --
+never once per item -- to keep the version history meaningful instead of
+noisy; see each method's docstring.
+
+Fixed interface: load_v1, get_latest_context, update_context, run_audit,
+resolve_flag, add_analytical_findings.
 """
 
 import json
@@ -20,29 +28,24 @@ from datetime import datetime, timezone
 
 import clickhouse_connect
 
-from .load_base_context import DOC_ID, AUTO_TABLES_MARKER, OPEN_FLAGS_MARKER, NONE_YET, NONE_OPEN, build_seed_content
+from .load_base_context import DOC_ID, OPEN_FLAGS_MARKER, FINDINGS_MARKER, NONE_YET, NONE_OPEN, build_seed_content
 from .audit_base_context import freshness_check, AUDIT_PROMPT, parse_llm_json
 
-UPDATE_PROMPT = """A new ClickHouse table was just created for a feature spec. Write a SHORT
-Markdown blurb (3-6 lines, a single bullet or short sub-list, no heading) for a living
-business-context document: what the table captures, its key columns, and how it joins to
-existing entities (user_id / application_id, or a spec-specific id if that's what it
-actually uses). If -- and only if -- the spec clearly implies a NEW metric formula or a
-known-issue-style caveat not already covered below, add ONE short bullet for each;
-otherwise don't invent one.
+UPDATE_PROMPT = """New ClickHouse tables were just created for a feature spec. Describe EACH
+one the same way the existing "raw event tables" catalog does: a "kind" (funnel/supporting/
+dimension), a short "emitted when" phrase (~6-10 words, e.g. "user taps Pay Now at
+checkout"), and its 2-5 most important columns -- skip the standard envelope (id,
+timestamp, user_id, application_id), name the columns specific to what this table
+actually captures.
 
-Current "Auto-instrumented tables" entries (context only -- don't duplicate an existing
-metric or caveat):
-{current_entries}
+NEW TABLES:
+{tables_block}
 
-NEW TABLE: {new_table}
-DDL:
-{schema_ddl}
-
-SPEC IT CAME FROM:
+SPEC THEY CAME FROM:
 {source_spec}
 
-Respond as JSON: {{"table_blurb_markdown": "- **{new_table}** -- ...", "changelog_summary": "one line"}}
+Respond as JSON: {{"tables": [{{"name": "...", "kind": "funnel|supporting|dimension",
+"emitted_when": "...", "key_columns": ["col1", "col2"]}}, ...], "changelog_summary": "one line covering all tables"}}
 No prose, no markdown fences outside the JSON string values.
 """
 
@@ -100,6 +103,47 @@ def _existing_flag_keys(entries: str) -> set[tuple[str, str, str]]:
         (m.group("flag_type"), m.group("entity"), m.group("key"))
         for m in _FLAG_LINE_RE.finditer(entries)
     }
+
+
+# Section 3 (base_context.md's "raw event tables" catalog) is a Markdown table,
+# not a marker+bullets section like Open flags/Analytical findings -- new tables
+# get appended as additional rows to this SAME table rather than a separate
+# section, so the document has one place that lists tables, not two. Matches
+# structurally on the table's own header (fixed since v1) and captures the
+# contiguous block of `| ... |` rows that follows it; appending just means
+# inserting more such rows at the end of that block.
+_SECTION3_TABLE_RE = re.compile(
+    r"(\| Table \| Kind \| Emitted when \| Key event-specific columns \|\n\|[-\s|]*\|\n)((?:\|.*\|\n)+)"
+)
+
+
+def _extract_section3_rows(markdown: str) -> str:
+    match = _SECTION3_TABLE_RE.search(markdown)
+    return match.group(2) if match else ""
+
+
+def _append_section3_rows(markdown: str, new_rows: str) -> str:
+    match = _SECTION3_TABLE_RE.search(markdown)
+    if not match:
+        raise ValueError("Section 3's table not found in document -- has its header format changed?")
+    rows_text = new_rows if new_rows.endswith("\n") else new_rows + "\n"
+    return markdown[:match.end(2)] + rows_text + markdown[match.end(2):]
+
+
+def _render_table3_row(table: dict) -> str:
+    """Renders one LLM-described table as a Section 3 row, in Python rather
+    than trusting the LLM to hand-format valid pipe-table syntax -- a literal
+    `|` anywhere in an LLM-written field would otherwise silently break the
+    table, so it's escaped here rather than left to chance."""
+    def esc(value) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+    name = esc(table.get("name", ""))
+    kind = esc(table.get("kind", "supporting"))
+    emitted_when = esc(table.get("emitted_when", ""))
+    columns = table.get("key_columns") or []
+    columns_str = ", ".join(f"`{esc(c)}`" for c in columns) if columns else "—"
+    return f"| `{name}` | {kind} | {emitted_when} | {columns_str} |"
 
 
 class ContextAgent:
@@ -195,46 +239,61 @@ class ContextAgent:
     # Auto-update on new tables
     # ============================================================
 
-    def update_context(self, new_table: str, schema_ddl: str, source_spec: str) -> int | None:
-        """Invoked by InstrumentationAgent right after a new table is created.
-        Asks the LLM for a short blurb documenting the table (not a rewrite of
-        the whole document -- see module docstring for why), appends it under
-        Section 8 (Auto-instrumented tables), writes a new version, then
-        re-audits so any new contradiction/gap/staleness this table introduces
-        gets surfaced in the same pass.
+    def update_context(self, new_tables: list[dict], source_spec: str) -> int | None:
+        """Invoked once per spec by InstrumentationAgent, after ALL of that
+        spec's tables have been created -- not once per table. `new_tables` is
+        a list of {"name": str, "ddl": str} dicts.
+
+        Appends one row per table directly to Section 3's existing table --
+        the same "raw event tables" catalog base_context.md ships with 8 rows
+        in -- rather than a separate "auto-instrumented" section, so the
+        document has ONE place that lists tables, not two. One LLM call
+        describes every table in a single pass (never a rewrite of the whole
+        document -- see module docstring for why); Python renders the actual
+        table row so a stray `|` in an LLM-written field can't corrupt the
+        table. Then re-audits once so any new contradiction/gap/staleness
+        these tables introduce gets surfaced in the same pass. A spec
+        producing N tables used to mean up to 2N new document versions (N
+        update_context calls, each with its own trailing run_audit); batched,
+        it's at most 2 regardless of N.
         """
-        latest = self._latest_doc()
-        if latest["version"] == 0:
-            print(f"Warning: business context not seeded yet -- call load_v1() first. Skipping update_context for {new_table}.")
+        if not new_tables:
             return None
 
-        current_entries = _extract_entries(latest["content"], AUTO_TABLES_MARKER)
+        table_names = [t["name"] for t in new_tables]
+        latest = self._latest_doc()
+        if latest["version"] == 0:
+            print(f"Warning: business context not seeded yet -- call load_v1() first. Skipping update_context for {table_names}.")
+            return None
+
+        tables_block = "\n\n".join(f"TABLE: {t['name']}\nDDL:\n{t['ddl']}" for t in new_tables)
         prompt = UPDATE_PROMPT.format(
-            current_entries=current_entries if not _is_empty_placeholder(current_entries) else NONE_YET,
-            new_table=new_table,
-            schema_ddl=schema_ddl,
+            tables_block=tables_block,
             source_spec=(source_spec or "")[:4000],
         )
         parsed = self._call_llm_json(prompt, "context_update")
         if parsed is None:
-            print(f"Skipping context update for {new_table} (LLM call failed) -- table was still created, just without context enrichment.")
+            print(f"Skipping context update for {table_names} (LLM call failed) -- tables were still created, just without context enrichment.")
             return None
 
-        blurb = str(parsed.get("table_blurb_markdown", "")).strip()
-        if not blurb:
-            print(f"Skipping context update for {new_table} -- LLM returned no blurb.")
+        table_entries = parsed.get("tables", [])
+        if not isinstance(table_entries, list):
+            table_entries = []
+        new_rows = "\n".join(_render_table3_row(t) for t in table_entries if isinstance(t, dict) and t.get("name"))
+        if not new_rows:
+            print(f"Skipping context update for {table_names} -- LLM returned no table rows.")
             return None
 
-        new_entries = blurb if _is_empty_placeholder(current_entries) else f"{current_entries.rstrip()}\n\n{blurb}"
-        new_content = _replace_entries(latest["content"], AUTO_TABLES_MARKER, new_entries)
+        new_content = _append_section3_rows(latest["content"], new_rows)
 
         next_version = latest["version"] + 1
-        changelog = str(parsed.get("changelog_summary") or f"Added {new_table}")
+        changelog = str(parsed.get("changelog_summary") or f"Added {len(new_tables)} table(s) to Section 3: {', '.join(table_names)}")
         self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
         print(f"Updated business context to version {next_version}: {changelog}")
 
-        # Re-audit new state -- only writes yet another version if it actually finds something new.
-        self.run_audit(scope=[new_table])
+        # Re-audit new state once for the whole batch -- only writes yet
+        # another version if it actually finds something new.
+        self.run_audit(scope=table_names)
         return next_version
 
     # ============================================================
@@ -246,12 +305,12 @@ class ContextAgent:
         business-context document:
         - freshness_check(): deterministic, no LLM -- does every table
           InstrumentationAgent has registered still actually exist? This is
-          exactly the check Section 9 (Data freshness check) tells readers to
+          exactly the check Section 8 (Data freshness check) tells readers to
           run; running it here means the document polices its own staleness.
         - An LLM pass over the full document for contradictions/ambiguity it
           can support from the text alone.
 
-        New flags (deduped against ones already listed under Section 10) are
+        New flags (deduped against ones already listed under Section 9) are
         appended there and a new version is written; if nothing new is found,
         no version is written and an empty list is returned -- re-running audit
         on an unchanged document doesn't pile up duplicate flags or noise the
@@ -322,7 +381,7 @@ class ContextAgent:
 
     def resolve_flag(self, entity: str, key: str) -> str | None:
         """Resolves an open flag matching (entity, key): asks the LLM for a
-        resolution note, removes the flag line from Section 10, and writes a
+        resolution note, removes the flag line from Section 9, and writes a
         new version whose changelog records the resolution. Returns the
         resolution note, or None if no matching open flag was found (or the
         LLM call failed).
@@ -354,6 +413,50 @@ class ContextAgent:
         self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
         print(f"Updated business context to version {next_version}: {changelog}")
         return resolution_notes
+
+    # ============================================================
+    # Recording AnalyticsAgent's findings
+    # ============================================================
+
+    def add_analytical_findings(self, insights: list, source: str = "") -> int | None:
+        """Appends AnalyticsAgent's found insights to Section 10 (Analytical
+        findings) as one batch, one version. Call this ONCE after a run
+        finishes -- e.g. once at the end of run_full_analysis(), or once at
+        the end of an interactive session, never per-insight -- for the same
+        reason update_context() batches per-spec rather than per-table: N
+        insights written one at a time would mean N version bumps for a
+        single analysis pass.
+
+        Purely mechanical, no LLM call: insights already have a title/
+        description/severity from generate_narrative_insights(), so this just
+        renders them as bullets. Accepts anything with those three attributes
+        (duck-typed, so callers don't need to import Insight from
+        agents.analytics.agent just to call this).
+        """
+        if not insights:
+            return None
+        latest = self._latest_doc()
+        if latest["version"] == 0:
+            print("Warning: business context not seeded yet -- call load_v1() first. Skipping add_analytical_findings().")
+            return None
+
+        source_note = f" ({source})" if source else ""
+        new_lines = "\n".join(
+            f"- **[{getattr(i, 'severity', 'info')}] {getattr(i, 'title', '')}**{source_note} -- {getattr(i, 'description', '')}"
+            for i in insights
+        )
+        if not new_lines.strip():
+            return None
+
+        current_entries = _extract_entries(latest["content"], FINDINGS_MARKER)
+        new_entries = new_lines if _is_empty_placeholder(current_entries) else f"{current_entries.rstrip()}\n{new_lines}"
+        new_content = _replace_entries(latest["content"], FINDINGS_MARKER, new_entries)
+
+        next_version = latest["version"] + 1
+        changelog = f"Added {len(insights)} analytical finding(s){source_note}"
+        self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
+        print(f"Updated business context to version {next_version}: {changelog}")
+        return next_version
 
 
 if __name__ == "__main__":

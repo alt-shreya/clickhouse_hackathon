@@ -98,10 +98,17 @@ def fake_client():
 def mock_llm_call():
     """Mock LLM response function matching ContextAgent's (prompt, span_name) -> str interface."""
     def _llm_call(prompt: str, span_name: str = "test") -> str:
-        if "NEW TABLE:" in prompt:
+        if "NEW TABLES:" in prompt:
             # Response for update_context()
             return json.dumps({
-                "table_blurb_markdown": "- **express_checkout_shown** -- tracks express checkout impressions, keyed by `user_id`.",
+                "tables": [
+                    {
+                        "name": "express_checkout_shown",
+                        "kind": "supporting",
+                        "emitted_when": "express checkout offer renders",
+                        "key_columns": ["express_method"],
+                    }
+                ],
                 "changelog_summary": "Documented express_checkout_shown",
             })
         if "resolving an open flag" in prompt:
@@ -198,8 +205,7 @@ def test_analytics_agent_receives_latest_context(fake_client, mock_llm_call):
     context_agent.load_v1()
 
     next_version = context_agent.update_context(
-        new_table="express_checkout_shown",
-        schema_ddl="CREATE TABLE atlys.express_checkout_shown (id UUID, timestamp DateTime, user_id String)",
+        new_tables=[{"name": "express_checkout_shown", "ddl": "CREATE TABLE atlys.express_checkout_shown (id UUID, timestamp DateTime, user_id String)"}],
         source_spec="# Express Checkout\nTracks express checkout impressions.",
     )
     assert next_version is not None and next_version >= 2

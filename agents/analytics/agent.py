@@ -171,6 +171,37 @@ SELECT month_start, total_revenue_usd, total_conversions,
        round(total_revenue_usd / nullIf(total_conversions, 0), 2) AS revenue_per_conversion
 FROM normalized_to_usd
 ORDER BY month_start ASC
+LIMIT 200;
+
+=== EXAMPLE 3: sequential funnel with a time bound (windowFunnel, not self-joins) ===
+-- "Did a user reach step N within a window after step 1?" -- e.g. did they click a
+-- reminder within 7 days of it opening, then convert within 30 days of that. Use
+-- windowFunnel() for this, not a chain of self-joins with a hand-written date-math
+-- ON condition per step -- every extra join is another place to get INTERVAL syntax
+-- wrong, and windowFunnel expresses the whole time-bounded sequence in one call.
+WITH steps AS (
+    SELECT user_id, timestamp, 'reminder_opened' AS step FROM atlys.reminder_opened
+    WHERE timestamp >= now() - INTERVAL 90 DAY
+    UNION ALL
+    SELECT user_id, timestamp, 'reminder_cta_clicked' AS step FROM atlys.reminder_cta_clicked
+    WHERE timestamp >= now() - INTERVAL 90 DAY
+    UNION ALL
+    SELECT user_id, timestamp, 'reconverted' AS step FROM atlys.reconverted
+    WHERE timestamp >= now() - INTERVAL 90 DAY
+),
+levels AS (
+    SELECT user_id,
+           windowFunnel(30 * 86400)(timestamp, step = 'reminder_opened', step = 'reminder_cta_clicked', step = 'reconverted') AS level
+    FROM steps
+    GROUP BY user_id
+)
+SELECT
+    countIf(level >= 1) AS opened,
+    countIf(level >= 2) AS clicked,
+    countIf(level >= 3) AS reconverted,
+    round(countIf(level >= 2) * 100.0 / nullIf(countIf(level >= 1), 0), 2) AS open_to_click_pct,
+    round(countIf(level >= 3) * 100.0 / nullIf(countIf(level >= 2), 0), 2) AS click_to_reconvert_pct
+FROM levels
 LIMIT 200;"""
 
 _LUCKY_TRIGGERS = ("random", "i'm feeling lucky", "im feeling lucky", "feeling lucky", "surprise me", "lucky")
@@ -181,6 +212,17 @@ _LUCKY_TRIGGERS = ("random", "i'm feeling lucky", "im feeling lucky", "feeling l
 _FORBIDDEN_SQL_KEYWORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|ATTACH|DETACH|RENAME|"
     r"GRANT|REVOKE|KILL|OPTIMIZE|SYSTEM|EXCHANGE|SET)\b",
+    re.IGNORECASE,
+)
+
+# ClickHouse requires date arithmetic to go through INTERVAL (`ts + INTERVAL 30
+# DAY`); a bare `ts + 30 DAY` is a SYNTAX_ERROR, not silently coerced. The LLM
+# gets this right most of the time but not always -- inconsistently, even
+# within the same query (one join's ON clause using INTERVAL correctly, the
+# next one dropping it). Matches a +/- sign followed directly by a number and
+# a time unit with nothing (in particular no "INTERVAL") in between.
+_MISSING_INTERVAL_RE = re.compile(
+    r"[+-]\s*\d+\s*(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|QUARTER|YEAR)S?\b",
     re.IGNORECASE,
 )
 
@@ -345,6 +387,25 @@ class AnalyticsAgent:
             raise ValueError("Generated query must be a read-only SELECT/WITH statement.")
         if _FORBIDDEN_SQL_KEYWORDS.search(sql):
             raise ValueError("Generated query contains a disallowed keyword -- only read-only SELECTs are permitted.")
+        # Cheap, high-signal truncation check: a response cut off mid-generation
+        # (hit max_tokens before finishing) almost always leaves an unclosed
+        # paren -- e.g. a WITH-chain's last CTE missing its closing ")" and the
+        # final SELECT entirely. Catching that here fails fast with a clear
+        # reason instead of a round-trip to ClickHouse for a cryptic
+        # "Unmatched parentheses" SYNTAX_ERROR pointing at a `LIMIT` we bolted
+        # onto the end of already-broken SQL.
+        opens, closes = sql.count("("), sql.count(")")
+        if opens != closes:
+            raise ValueError(
+                f"Generated query has unbalanced parentheses ({opens} '(' vs {closes} ')') -- "
+                "it was likely cut off mid-generation. Try a simpler/narrower request, or just ask again."
+            )
+        bad_interval = _MISSING_INTERVAL_RE.search(sql)
+        if bad_interval:
+            raise ValueError(
+                f"Generated query does date arithmetic without INTERVAL ({bad_interval.group(0)!r}) -- "
+                "ClickHouse requires e.g. `+ INTERVAL 30 DAY`, not `+ 30 DAY`. Try again."
+            )
 
     def _sql_system_prompt(self) -> str:
         return f"""You are an expert ClickHouse SQL analyst.
@@ -379,9 +440,19 @@ Other rules:
 - For segment comparisons: GROUP BY the relevant segment column(s) (e.g. device_type,
   geoip_country_code, os, funnel_type) and order by the primary metric, not the segment name.
 - For correlations: use corr() or covarPop() between two numeric measures.
-- For funnels/sequential behavior: prefer windowFunnel()/sequenceMatch() over
-  independent per-table counts, per the provided analysis guidance.
+- For ANY "did step B happen after step A" question -- funnels, drop-off,
+  recovery/re-engagement, "converted within N days of X" -- default to
+  windowFunnel() (see Example 3) over a UNIONed event stream, per the provided
+  analysis guidance. Do NOT hand-write a chain of self-joins with a per-step
+  date-math ON condition; that's both less idiomatic and exactly how the
+  INTERVAL mistake above tends to happen (one more join, one more chance to
+  drop it). Only fall back to explicit joins if the steps span tables with no
+  shared timestamp-ordered identifier windowFunnel can key on.
 - Always qualify table names with the database (e.g. atlys.purchase_completed).
+- ALL date/time arithmetic must go through INTERVAL: `ts + INTERVAL 30 DAY`,
+  `ts - INTERVAL 7 DAY`. A bare `ts + 30 DAY` (no INTERVAL) is a ClickHouse
+  SYNTAX_ERROR, not shorthand -- this applies every single time you add/subtract
+  a duration, including inside JOIN ... ON clauses, not just in WHERE.
 
 {_GOOD_QUERY_EXAMPLES}
 Match this style: CTEs when the logic has real stages, CASE-based bucketing over raw
@@ -427,7 +498,14 @@ Return only the SQL statement."""
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=800,
+                # 800 was sized for simple single-table aggregations; the style
+                # guidance above (CTEs, guarded division, bucketed grouping) and
+                # multi-table comparisons routinely need more room than that to
+                # finish -- 800 was cutting a real multi-CTE query off mid-way
+                # through its last CTE, before the final SELECT, producing
+                # invalid SQL (unbalanced parens) that only failed once it hit
+                # ClickHouse.
+                max_tokens=2500,
             )
             raw = (response.choices[0].message.content or "").strip()
             sql = self._extract_sql(raw)
@@ -472,6 +550,7 @@ Return only the SQL statement."""
         and interpret the result -- until they quit."""
         self._print_context_changes(self.discover_context_changes())
 
+        insights_before = len(self.insights)
         rounds = 0
         while max_rounds is None or rounds < max_rounds:
             request = self.ask_user_for_request(prompt_fn)
@@ -482,6 +561,11 @@ Return only the SQL statement."""
             except Exception as e:
                 print(f"Could not complete that request: {e}")
             rounds += 1
+
+        # One batch write for the whole session, not one per question --
+        # matches update_context()'s "batch per run, not per item" rule.
+        if self.context_agent and hasattr(self.context_agent, "add_analytical_findings"):
+            self.context_agent.add_analytical_findings(self.insights[insights_before:], source="interactive session")
 
         return self.insights
 
@@ -786,6 +870,8 @@ Return only the SQL statement."""
         answered that spec's own PM questions.
         """
         with get_tracer().trace_span("analytics.run_full_analysis", metadata={"spec_name": spec_name}):
+            insights_before = len(self.insights)
+
             # What the ContextAgent/InstrumentationAgent have on record right now
             # (independent of the spec_tables argument below).
             changes = self.discover_context_changes()
@@ -872,6 +958,11 @@ Return only the SQL statement."""
 
             context_summary = self._context_text()
             self.generate_narrative_insights(query_results, context_summary, pm_questions=pm_questions)
+
+            # One batch write for this whole run, not one per insight --
+            # matches update_context()'s "batch per run, not per item" rule.
+            if self.context_agent and hasattr(self.context_agent, "add_analytical_findings"):
+                self.context_agent.add_analytical_findings(self.insights[insights_before:], source=spec_name or "core funnel analysis")
 
             return self.insights
 

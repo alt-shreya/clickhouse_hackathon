@@ -45,11 +45,32 @@ class ColumnSpec:
         """Convert to ClickHouse type string."""
         ch_type = self.type.strip()
 
-        # Normalize any accidental double wrappers from upstream generation.
-        while ch_type.startswith("Nullable(") and ch_type.endswith(")"):
-            ch_type = ch_type[len("Nullable("):-1].strip()
-        while ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
-            ch_type = ch_type[len("LowCardinality("):-1].strip()
+        # LLM sometimes emits e.g. "Decimal64(10, 2)" -- DecimalN (N in
+        # 32/64/128/256) takes exactly ONE argument (scale; precision is
+        # implied by the bit width), so two arguments is a ClickHouse syntax
+        # error (NUMBER_OF_ARGUMENTS_DOESNT_MATCH). The generic Decimal(precision,
+        # scale) form takes exactly two and resolves to the right width itself,
+        # so normalize to that instead of guessing which argument to drop.
+        ch_type = re.sub(r"^Decimal(?:32|64|128|256)(\(\s*\d+\s*,\s*\d+\s*\))$", r"Decimal\1", ch_type, flags=re.IGNORECASE)
+
+        # Normalize accidental wrapper nesting from upstream generation --
+        # strip Nullable(...)/LowCardinality(...) in whatever order/depth they
+        # appear down to the bare base type, then re-apply exactly the
+        # wrappers self.nullable/low_cardinality ask for below. A prior
+        # version stripped each wrapper kind in one single pass in a fixed
+        # order, so "LowCardinality(Nullable(String))" only had its outer
+        # LowCardinality layer stripped (the Nullable-stripping pass had
+        # already finished by the time the inner Nullable was exposed),
+        # leaving "Nullable(String)" -- which nullable=True then re-wrapped as
+        # Nullable(Nullable(String)), rejected outright by ClickHouse
+        # (ILLEGAL_TYPE_OF_ARGUMENT: "Nested type ... cannot be inside Nullable").
+        while True:
+            if ch_type.startswith("Nullable(") and ch_type.endswith(")"):
+                ch_type = ch_type[len("Nullable("):-1].strip()
+            elif ch_type.startswith("LowCardinality(") and ch_type.endswith(")"):
+                ch_type = ch_type[len("LowCardinality("):-1].strip()
+            else:
+                break
 
         # ClickHouse is strict about LowCardinality + Nullable nesting.
         # For this pipeline, keep nullable strings as plain Nullable(String)
@@ -994,9 +1015,17 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
     def execute_and_update_context(self, source_spec: str = "") -> Dict[str, Any]:
         """
         Executes DDL statements to create generated tables in ClickHouse,
-        registers them in meta_context_registry, invokes ContextAgent.update_context()
-        to document the new table in the business-context document, then creates a
-        daily segment-rollup materialized view on this spec's primary table.
+        registers them in meta_context_registry, then invokes
+        ContextAgent.update_context() ONCE for every table this spec actually
+        created (not once per table) to document them all in a single new
+        business-context document version. A prior version called
+        update_context() inside this loop -- one LLM call and one version bump
+        per table, each of which could ALSO trigger its own run_audit() and a
+        second version bump -- so a single 5-table spec could produce up to 10
+        new document versions in one pipeline run, all landing back-to-back
+        with nothing meaningful between them. Batching to one call means at
+        most 2 version bumps per spec (the update, then the trailing audit)
+        regardless of table count.
         """
         results = {}
         created_schemas: List[TableSchema] = []
@@ -1004,11 +1033,10 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             ddl = schema.to_ddl(self.database)
 
             # Execute CREATE TABLE on ClickHouse. If this fails, the table does
-            # not exist -- registering it in meta_context_registry or invoking
-            # ContextAgent.update_context() (which ALTERs the table to add
-            # comments) would either lie about the table's existence or crash
-            # outright (UNKNOWN_TABLE) and take down every other schema in this
-            # spec along with it. Skip straight to the next table instead.
+            # not exist -- registering it in meta_context_registry or documenting
+            # it in the business-context document would either lie about its
+            # existence or crash outright (UNKNOWN_TABLE) and take down every
+            # other schema in this spec along with it. Skip to the next table.
             ddl_ok = True
             if self.client:
                 try:
@@ -1026,21 +1054,24 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
 
             # Register in meta_context_registry
             registered = self.register_table(schema)
+            results[schema_name] = {"registered": registered, "ddl": ddl}
 
-            # Invoke ContextAgent integration contract
-            next_version = None
-            if self.context_agent and hasattr(self.context_agent, "update_context"):
-                print(f"Invoking ContextAgent.update_context for {schema_name}...")
-                next_version = self.context_agent.update_context(
-                    new_table=schema_name,
-                    schema_ddl=ddl,
-                    source_spec=source_spec,
-                )
-
-            results[schema_name] = {
-                "registered": registered,
-                "context_version": next_version,
-            }
+        # One ContextAgent update for every table this spec created, in a
+        # single call/version -- not one per table.
+        if created_schemas and self.context_agent and hasattr(self.context_agent, "update_context"):
+            table_names = [s.name for s in created_schemas]
+            print(f"Invoking ContextAgent.update_context for {len(created_schemas)} table(s): {', '.join(table_names)}...")
+            next_version = self.context_agent.update_context(
+                new_tables=[{"name": s.name, "ddl": results[s.name]["ddl"]} for s in created_schemas],
+                source_spec=source_spec,
+            )
+            for name in table_names:
+                results[name]["context_version"] = next_version
+        else:
+            for name in results:
+                results[name].setdefault("context_version", None)
+        for r in results.values():
+            r.pop("ddl", None)
 
         # One rollup MV per spec, on the table worth pre-aggregating (tables must
         # already exist, so this runs after the create-table loop above). Only
@@ -1075,7 +1106,7 @@ Focus on: proper ClickHouse types, partitioning, ordering, codecs, and integrati
             
             # 1. Load context
             self.load_context()
-            print(f"  Loaded {len(self._existing_tables)} existing tables")
+            print(f"  Found {len(self._existing_tables)} existing tables in the registry")
             
             # 2. Parse spec
             analysis = self.parse_spec(spec_dir)

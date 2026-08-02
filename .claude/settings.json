@@ -12,7 +12,11 @@
       "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/dashboard.html)",
       "Bash(timeout 60 python -c ' *)",
       "Bash(timeout 30 python -c ' *)",
-      "Bash(timeout 90 python -c ' *)"
+      "Bash(timeout 90 python -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(git restore *)",
+      "Bash(git add *)",
+      "Bash(xxd)"
     ]
   }
 }
