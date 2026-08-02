@@ -2,28 +2,22 @@
 
 ## Atlys Track
 
-## Project name
-
-Feature spec in, ClickHouse schema and PM-ready insight out — three agents, one
-pipeline.
+## Insight Out
+Meet the little voices inside your data.
 
 ## Team Members
 - Krishna @cybraia
 - Shreya @alt-shreya
 
 ## What it does
+> Much like a cartographer looks to Atlas for answers, your team can now look to this agentic workflow for answers.
 
-Atlys Shrugged takes a raw feature spec (a markdown doc plus a sample events file) and
-runs it through three cooperating agents: an **Instrumentation Agent** that designs
-and executes the ClickHouse DDL for the new feature, an **Analytics Agent** that
-runs sequenced funnel and segment analysis over both the new tables and the
-existing funnel and writes a PM-readable insight report, and a **Context Agent**
-that keeps a single living business-context document up to date as new tables get
-instrumented and flags anything that goes stale or contradictory. Every run is
-traced end to end in Langfuse, and each spec produces a self-contained HTML
-dashboard alongside its generated schema and insight summary — so a team can go
-from "here's a new feature spec" to "here's the schema, the dashboard, and what it
-means" without anyone hand-writing SQL or a changelog.
+Insight Out takes a raw feature spec (a markdown doc plus an `.ndjson` sample events file) and runs it through a multi-agent system: 
+* an **Instrumentation Agent** that designs and executes the ClickHouse DDL for the new feature 
+* an **Analytics Agent** that runs sequenced funnel and segment analysis over both the new tables and the existing funnel and writes a PM-readable insight report, and 
+* a **Context Agent** that keeps a single living business-context document up to date as new tables get instrumented and flags anything that goes stale or contradictory. 
+
+Every run is traced end to end in Langfuse, and displayed to the user via STreamlit.
 
 ## Hosted Demo
 
@@ -35,7 +29,7 @@ _TODO: add the 2–3 minute recorded demo video link here (mandatory for submiss
 
 ## Architecture
 
-Atlys Shrugged is three agents plus a shared context layer, run sequentially by
+Insight Out is three agents plus a shared context layer, run sequentially by
 `main.py` for a single spec directory: **Context → Instrumentation → Analytics →
 Visualization**.
 
@@ -43,30 +37,39 @@ Visualization**.
   generates ClickHouse table DDL plus a daily segment-rollup materialized view,
   executes it against the live ClickHouse Cloud service, and registers the new
   tables' schema in `atlys.meta_context_registry`.
+
 - **Analytics Agent** (`agents/analytics/`) hands off from Instrumentation once
-  the new tables exist. It runs sequenced funnel analysis (`windowFunnel`, not
-  independent per-table counts) across both the core funnel and the spec's new
-  tables, then generates LLM narrative insights that directly answer the spec's
-  own "Questions the PM will ask."
+  the new tables exist. on an interactive terminal run, it actually
+   asks the user what insight they'd like to see next -- in plain English -- and
+   acts on it: it turns that request into a single read-only ClickHouse SQL query
+   itself (the LLM's only job is writing the SQL; ClickHouse does 100% of the
+   aggregation once it runs), executes it, and interprets the returned rows into
+   grounded narrative insights before looping back to ask again.
+
 - **Context Agent** (`agents/context/`) runs both before and after the other two:
   it seeds/reads the current business-context document going in, and after
-  Instrumentation creates new tables, it auto-documents them under an
-  "Auto-instrumented tables" section. A deterministic freshness check (does every
+  Instrumentation creates new tables, it auto-documents them in the base_context. A deterministic freshness check (does every
   registered table still exist?) plus an LLM pass surface contradictions, gaps,
   and obsolete facts into an "Open flags" section.
 
 **Where the context layer lives, and why:** the whole business-context document is
 stored as **one Markdown blob per version** in a ClickHouse table,
 `analytics_context.business_context` (`doc_id`, `content`, `version`,
-`changelog_summary`, `updated_at`), a `ReplacingMergeTree` keyed on `doc_id`. Every
-change — the initial seed, an auto-documented table, a new audit flag, a resolved
-flag — is a new `INSERT` with `version = previous + 1` rather than a mutation.
-That makes the table double as its own audit trail: readers always
+`changelog_summary`, `updated_at`), a `ReplacingMergeTree` keyed on `doc_id`. 
+
+Every change — the initial seed, an auto-documented table, a new audit flag, a resolved flag — is a new `INSERT` with `version = previous + 1` rather than a mutation. That makes the table double as its own audit trail: readers always
 `ORDER BY version DESC LIMIT 1` to get current state, but the full history of how
 the context evolved is queryable directly, in the same store as the data it
-describes, with no separate file store or vector DB to keep in sync. We chose a
-ClickHouse table over a file on disk specifically so context history survives
-independent of the repo and is queryable the same way the data is.
+describes, with no separate file store or vector DB to keep in sync. 
+
+A vector store buys you semantic search over chunks, but **this document doesn't need retrieval-by-similarity** -- every reader wants the exact current version (or
+an exact prior one), a `WHERE`/`ORDER BY` lookup, not a nearest-neighbor guess,
+and chunking a single coherent doc into embeddings would just add a stale-index
+problem on top of the one we're already solving. 
+
+Keeping it in the same ClickHouse service as everything
+else means the Analytics Agent reads context and event data through the same
+client, in the same query engine, with **one fewer moving part** to keep in sync.
 
 **Langfuse tracing:** all three agents emit spans/generations through a shared
 tracer in `agents/tracing/`, so a single spec run produces one trace showing the
@@ -80,34 +83,25 @@ JSONL file so the pipeline never depends on external tracing to run.
 `agents/config.py:make_llm_call_fn()`. The primary provider is **Anthropic**
 (`claude-haiku-4-5-20251001` by default) for fast, cheap structured generation
 across schema design, narrative insights, and the context audit; **OpenRouter** is
-a configured fallback if only that key is set. If neither key is present, every
-agent still runs end to end but degrades to rule-based logic instead of LLM
-reasoning, rather than crashing — deliberately, so the pipeline is demo-able even
-without API keys configured.
+a configured fallback if only that key is set.
 
-## How we built it
+## How we Built it
 
-**Stack:** Python, ClickHouse Cloud (via the `clickhouse-connect` client),
-Anthropic/OpenRouter for LLM calls, Langfuse for tracing, and a self-contained
-HTML/JS dashboard builder (`agents/visualization/dashboard_builder.py`) with no
-external frontend framework.
+**Stack:** 
+1. Python
+2. ClickHouse Cloud (via the `clickhouse-connect` client)
+3. Langfuse for tracing
+4. Anthropic/OpenRouter for LLM calls, 
+5. Streamlit for UI
 
-**Sample analysis — quarterly & monthly funnel and revenue.** Three worked,
-hand-run queries against the live base dataset (as of 2026-08-02), in the same
-"CTEs down to a handful of meaningful rows" style the Analytics Agent's
-`nl_to_sql()` few-shot examples use (`agents/analytics/agent.py`,
-`_GOOD_QUERY_EXAMPLES`). Kept here as a reproducible reference for what
-"PM-readable insight" looks like end to end — query, then result.
+**Sample Analyses** 
 
 **Read the Q3 2026 / July 2026 rows in every table below as incomplete, not
 anomalous** — see the callout after the tables.
 
 ### 1. Quarterly session → purchase conversion rate
 
-Unions the four funnel tables per `app_session_id`, per quarter, and marks a
-session `has_purchased` if it ever fires `purchase_completed` — a presence check
-via `max(CASE ...)`, not a sequenced `windowFunnel()`, since the question is "did
-this session convert at all," not "in what order."
+> Answers the question: WHat percentage of times in the past quarters did a session convert to a purchase?
 
 ```sql
 WITH
@@ -145,11 +139,7 @@ ORDER BY quarter_start ASC;
 
 ### 2. Quarterly revenue (currency-normalized) + applications started
 
-Sums `purchase_completed.value` per native `currency`, converts every currency to
-USD with a fixed rate table, then joins in `application_started` volume per
-quarter to compute revenue per conversion. All rows share
-`currency_group = 'USD (All Currencies Converted)'` (omitted from the table below
-as constant).
+> How many started applications converted to revenue in the past few quarters, and what was the average revenue per conversion?
 
 ```sql
 WITH
@@ -211,7 +201,18 @@ ORDER BY quarter_start ASC;
 
 ### 3. Monthly revenue (currency-normalized) + applications started
 
-Same shape as (2), bucketed by `toStartOfMonth` instead of `toStartOfQuarter`.
+> How many started applications converted to revenue in the past few months, and what was the average revenue per conversion? (Revenue converted to USD using the following static conversion rates
+
+ ``` 
+  'INR' ->  0.012
+  'AED' -> 0.272
+  'GBP' -> 1.28
+  'AUD' -> 0.65
+  'SAR' -> 0.267
+  'QAR' -> 0.274
+  'OMR' -> 2.60
+  'SGD' -> 0.75
+  ```
 
 ```sql
 WITH
@@ -275,42 +276,10 @@ ORDER BY month_start ASC;
 | 2026-06-01 | $75,232.52 | 1,202 | $62.59 | 30,370 |
 | 2026-07-01 | $89.78 | 2 | $44.89 | 9 |
 
-**Reading these numbers:** Q1 → Q2 2026 session volume grew ~27% (440k → 561k)
-with applications started up a matching ~27% (68k → 86k) and revenue per
-conversion essentially flat (~$64); conversion rate held steady around 0.7%. The
-2026-07-01 row in every table above is **not** a real 14%-conversion,
-$44.89-revenue-per-conversion quarter/month — it's `toStartOfQuarter`/
-`toStartOfMonth` bucketing the handful of rows that exist for July 2026 so far
-(this dataset's "now" trails the wall-clock date this repo was written on,
-2026-08-02). A bucket with 2 conversions swings wildly on tiny-sample noise. **Any
-dashboard or agent-generated insight that buckets by calendar period must either
-exclude the in-progress period or flag it as partial** — otherwise a correct query
-silently produces a misleading PM-facing anomaly.
-
-**Implementation notes:**
-
-- **In-progress calendar buckets read as false anomalies.** The current
-  quarter/month at query time will always show a session/conversion count far
-  below prior periods, because it's partial — see the July 2026 rows above. The
-  Analytics Agent's narrative insights, and any dashboard built on
-  `toStartOfQuarter`/`toStartOfMonth`/`toDate` grouping, filter out or explicitly
-  caveat the current, still-accumulating bucket rather than reporting its skewed
-  rate/average at face value.
-- `meta_context_registry.columns` is `Array(Tuple(name, type, description))` —
-  registration writes must match this shape exactly (see
-  `InstrumentationAgent.register_table()`); a raw JSON string does not parse.
-- `analytics_context.business_context` never gets mutated in place — every
-  change (seed, auto-documented table, audit flag, resolved flag) is a new
-  `INSERT` with `version = previous + 1`; readers always
-  `ORDER BY version DESC LIMIT 1` rather than relying on background-merge dedup.
-  See `agents/context/agent.py` module docstring.
-- `ContextAgent.run_audit()` dedups against already-open flags for the same
-  `(entity, key, flag_type)` before inserting, so re-running the pipeline on an
-  unchanged context layer doesn't pile up duplicate flags.
 
 ## How to run it
 
-1. **Python deps**: `pip install -r requirements.txt`
+1. **Install Python dependenciess**: `pip install -r requirements.txt`
 2. **Copy `.env.example` to `.env`** and fill in:
    - `CLICKHOUSE_HOST` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` (ClickHouse Cloud service)
    - `ANTHROPIC_API_KEY` (preferred LLM provider — see `agents/config.py:AnthropicConfig`,
@@ -319,19 +288,10 @@ silently produces a misleading PM-facing anomaly.
      rule-based logic instead of LLM reasoning (schema generation, narrative insights,
      context audit all degrade gracefully rather than crashing).
    - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (optional, for tracing)
-3. **Load the base dataset** (8 existing funnel/engagement tables, ~2.5M rows) into
-   your ClickHouse Cloud service per the challenge package's `data/load.sh`.
-4. **Control-plane tables** (`analytics_context.business_context`,
-   `atlys.meta_context_registry`) are created automatically by `main.py` on first
-   run via `agents/setup.py:ensure_control_tables()` (`CREATE TABLE IF NOT EXISTS`,
-   idempotent). No manual step needed.
-5. **Challenge specs**: fetch `specs/<name>/{spec.md,events.ndjson}` from the
-   challenge repo into a local `specs/` directory (gitignored — these are large
-   and spec-provider-specific, not checked in).
-6. **Run the pipeline**:
+3. **Run the pipeline**:
 
    ```bash
-   python main.py specs/01_express_checkout
+   python main.py specs/06_checkout_promo/
    ```
 
    This runs Context → Instrumentation → Analytics → Visualization end to end and

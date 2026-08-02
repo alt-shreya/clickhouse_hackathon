@@ -135,17 +135,17 @@ LUCKY_QUERIES: List[Dict[str, str]] = [
 # both real, previously hand-written analyses, not toy examples. The point isn't
 # these exact queries; it's "aggregate down to a handful of meaningful rows" instead
 # of a flat multi-dimension dump.
-_GOOD_QUERY_EXAMPLES = """=== EXAMPLE 1: bucketed segment comparison (not a raw per-value breakdown) ===
+_GOOD_QUERY_EXAMPLES = """=== EXAMPLE 1: bucketed segment comparison (countIf/avgIf, not CASE/SUM(CASE...)) ===
 SELECT
     CASE
         WHEN lower(citizenship) IN ('in', 'pk') THEN 'Latin / Major Script (IN, PK)'
         ELSE 'Non-Latin / Other Script (Other)'
     END AS citizenship_group,
     count() AS total_uploads,
-    sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) AS uploads_with_retries,
-    round(sum(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END) * 100.0 / nullIf(count(), 0), 2) AS pct_with_retries,
-    round(avg(retry_count), 2) AS avg_retry_count,
-    sum(is_crossed_failed_attempt_threshold) AS threshold_failures
+    countIf(retry_count > 0) AS uploads_with_retries,
+    round(countIf(retry_count > 0) * 100.0 / nullIf(count(), 0), 2) AS pct_with_retries,
+    round(avgIf(retry_count, retry_count > 0), 2) AS avg_retries_when_retried,
+    countIf(coalesce(is_crossed_failed_attempt_threshold, 0) = 1) AS threshold_failures
 FROM atlys.document_uploaded
 WHERE lower(doc_type) LIKE '%passport%'
 GROUP BY citizenship_group
@@ -453,6 +453,15 @@ Other rules:
   `ts - INTERVAL 7 DAY`. A bare `ts + 30 DAY` (no INTERVAL) is a ClickHouse
   SYNTAX_ERROR, not shorthand -- this applies every single time you add/subtract
   a duration, including inside JOIN ... ON clauses, not just in WHERE.
+- Prefer ClickHouse's conditional aggregate functions over generic
+  CASE/SUM(CASE...) patterns: use `countIf(cond)`, `sumIf(cond, val)`, and
+  `avgIf(cond, val)` instead of `sum(CASE WHEN cond THEN 1 ELSE 0 END)` or
+  `avg(CASE WHEN cond THEN val END)` -- they're shorter, clearer, and this is
+  exactly the kind of engine-native function the query should showcase, not
+  portable-but-generic ANSI SQL. Use `coalesce(col, default)` for any nullable
+  column rather than leaving a NULL to silently drop out of an aggregate. Use
+  `windowFunnel()` (see Example 3) for any "did step B happen after step A"
+  question rather than self-joins.
 
 {_GOOD_QUERY_EXAMPLES}
 Match this style: CTEs when the logic has real stages, CASE-based bucketing over raw
