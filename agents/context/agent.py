@@ -214,6 +214,9 @@ class ContextAgent:
     # ============================================================
 
     def _latest_doc(self, doc_id: str = DOC_ID) -> dict:
+        if self.client is None:
+            return {"doc_id": doc_id, "content": "", "version": 0, "changelog_summary": "", "updated_at": None}
+
         query = f"""
             SELECT doc_id, content, version, changelog_summary, updated_at
             FROM analytics_context.business_context
@@ -221,8 +224,13 @@ class ContextAgent:
             ORDER BY version DESC
             LIMIT 1
         """
-        result = self.client.query(query)
-        if not result.result_rows:
+        try:
+            result = self.client.query(query)
+        except Exception as exc:
+            print(f"Warning: could not read business context from ClickHouse: {exc}")
+            return {"doc_id": doc_id, "content": "", "version": 0, "changelog_summary": "", "updated_at": None}
+
+        if not getattr(result, "result_rows", None):
             return {"doc_id": doc_id, "content": "", "version": 0, "changelog_summary": "", "updated_at": None}
         return dict(zip(result.column_names, result.result_rows[0]))
 
@@ -238,17 +246,24 @@ class ContextAgent:
         return self._latest_doc()
 
     def _insert_version(self, content: str, version: int, changelog_summary: str, doc_id: str = DOC_ID) -> None:
+        if self.client is None:
+            print("Warning: ClickHouse client unavailable; skipping business context write.")
+            return
+
         # async_insert=0: forces a synchronous, durable write. This ClickHouse
         # Cloud service defaults to async_insert=1 (server-side buffering before
         # a background flush); observed live, rapid-fire small control-plane
         # inserts silently lost rows when the process moved on before the async
         # buffer flushed. Every write here is low-volume and correctness-critical.
-        self.client.insert(
-            "analytics_context.business_context",
-            [[doc_id, content, version, changelog_summary, datetime.now(timezone.utc)]],
-            column_names=["doc_id", "content", "version", "changelog_summary", "updated_at"],
-            settings={"async_insert": 0},
-        )
+        try:
+            self.client.insert(
+                "analytics_context.business_context",
+                [[doc_id, content, version, changelog_summary, datetime.now(timezone.utc)]],
+                column_names=["doc_id", "content", "version", "changelog_summary", "updated_at"],
+                settings={"async_insert": 0},
+            )
+        except Exception as exc:
+            print(f"Warning: could not write business context to ClickHouse: {exc}")
 
     # ============================================================
     # Seeding
