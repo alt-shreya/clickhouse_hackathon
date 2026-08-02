@@ -269,11 +269,10 @@ def load_dotenv(env_path: Optional[Path] = None) -> bool:
     Returns True if loaded, False if file not found.
     """
     if env_path is None:
+        # Search from cwd and from this package so running from repo root still works.
         search_roots = [Path.cwd(), Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent]
         seen = set()
-
         for root in search_roots:
-            # First, check this directory and its ancestors for a .env file.
             for parent in [root] + list(root.parents):
                 if parent in seen:
                     continue
@@ -284,28 +283,6 @@ def load_dotenv(env_path: Optional[Path] = None) -> bool:
                     break
             if env_path is not None:
                 break
-
-        if env_path is None:
-            # Also check sibling repositories under a shared parent directory.
-            # This covers layouts like /workspace/atlys-agent and
-            # /workspace/main/clickhouse_hackathon.
-            for root in search_roots:
-                if not root.exists():
-                    continue
-                for parent in [root] + list(root.parents):
-                    if not parent.exists():
-                        continue
-                    try:
-                        for child in parent.iterdir():
-                            if child.is_dir() and (child / ".env").exists():
-                                env_path = child / ".env"
-                                break
-                        if env_path is not None:
-                            break
-                    except OSError:
-                        continue
-                if env_path is not None:
-                    break
     
     if env_path is None or not env_path.exists():
         return False
