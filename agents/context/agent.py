@@ -59,6 +59,30 @@ forward (1-3 sentences). Respond in JSON: {{"resolution_notes": "..."}}
 No prose, no markdown fences.
 """
 
+# Enforces Section 5's own mandatory rule (base_context.md): a known issue that
+# fresh query results contradict must be corrected, not left to go stale.
+KNOWN_ISSUE_CORRECTION_PROMPT = """You are checking whether new analytical findings
+contradict any entry in a "Known-issues log" (a numbered list of known data/product
+issues, each tagged K1, K2, etc). An insight CONTRADICTS a known issue only if the data
+now shows the issue's own claim is wrong, resolved, or meaningfully different from what
+it states -- not merely "related to" or "about the same table as" it. Most findings
+contradict nothing; don't force a match.
+
+KNOWN-ISSUES LOG:
+{known_issues}
+
+NEW ANALYTICAL FINDINGS:
+{findings}
+
+For each known issue a finding directly contradicts, provide a corrected replacement for
+that ENTIRE numbered item -- keep its number and Kn tag exactly (e.g. "3. **K3 — ...** ...")
+and rewrite the rest to reflect what the data now shows.
+
+Respond as JSON: {{"corrections": [{{"kn": "K3", "corrected_block": "3. **K3 — ...** ...", "reason": "one line"}}]}}
+If nothing contradicts, respond {{"corrections": []}}. No prose, no markdown fences outside
+the JSON string values.
+"""
+
 # A flag is rendered as one bullet line, in a format that's both readable and
 # machine-parseable so re-auditing an unchanged document doesn't re-flag the
 # same issue every time (see _existing_flag_keys()).
@@ -88,6 +112,40 @@ def _replace_entries(markdown: str, marker: str, new_body: str) -> str:
 def _is_empty_placeholder(entries: str) -> bool:
     stripped = entries.strip()
     return stripped in ("", NONE_YET, NONE_OPEN)
+
+
+def _extract_section_by_heading(markdown: str, heading_text: str) -> str:
+    """Read-only extraction of a whole section's body by heading text (handles
+    an optional leading "N. " number), for sections that aren't marker-based --
+    e.g. Section 5's Known-issues log, which AnalyticsAgent's findings get
+    checked against but never append to directly."""
+    pattern = re.compile(
+        rf"^##\s*(?:\d+\.\s*)?{re.escape(heading_text)}[^\n]*\n(.*?)" + _SECTION_STOP,
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(markdown)
+    return match.group(1) if match else ""
+
+
+# Matches one numbered item in Section 5's Known-issues log, e.g. "3. **K3 —
+# Title.** description text...", up through (but not including) the next
+# numbered item or the section's end. Used to replace a single Kn entry in
+# place without touching the rest of the log.
+def _known_issue_pattern(kn: str) -> re.Pattern:
+    return re.compile(
+        rf"\d+\.\s+\*\*{re.escape(kn)}\b.*?(?=\n\d+\.\s+\*\*K\d+|\n---\s*\n|\n##\s|\Z)",
+        re.DOTALL,
+    )
+
+
+def _replace_known_issue(markdown: str, kn: str, corrected_block: str) -> bool | str:
+    """Replaces the numbered item tagged `kn` (e.g. "K3") with corrected_block.
+    Returns the updated markdown, or False if `kn` wasn't found (nothing
+    corrected -- caller decides whether that's worth logging)."""
+    match = _known_issue_pattern(kn).search(markdown)
+    if not match:
+        return False
+    return markdown[:match.start()] + corrected_block.strip() + "\n" + markdown[match.end():]
 
 
 def _render_flag_line(flag: dict) -> str:
@@ -420,18 +478,21 @@ class ContextAgent:
 
     def add_analytical_findings(self, insights: list, source: str = "") -> int | None:
         """Appends AnalyticsAgent's found insights to Section 10 (Analytical
-        findings) as one batch, one version. Call this ONCE after a run
+        findings), and -- per Section 5's own mandatory rule -- checks whether
+        any of them contradict a known issue there, correcting it in place if
+        so. Both happen as ONE batch, ONE version. Call this ONCE after a run
         finishes -- e.g. once at the end of run_full_analysis(), or once at
         the end of an interactive session, never per-insight -- for the same
         reason update_context() batches per-spec rather than per-table: N
         insights written one at a time would mean N version bumps for a
         single analysis pass.
 
-        Purely mechanical, no LLM call: insights already have a title/
-        description/severity from generate_narrative_insights(), so this just
-        renders them as bullets. Accepts anything with those three attributes
-        (duck-typed, so callers don't need to import Insight from
-        agents.analytics.agent just to call this).
+        The Section 10 append is purely mechanical (no LLM call): insights
+        already have a title/description/severity from
+        generate_narrative_insights(), so this just renders them as bullets.
+        Accepts anything with those three attributes (duck-typed, so callers
+        don't need to import Insight from agents.analytics.agent just to call
+        this). The known-issue check is the one LLM call in this method.
         """
         if not insights:
             return None
@@ -448,15 +509,50 @@ class ContextAgent:
         if not new_lines.strip():
             return None
 
-        current_entries = _extract_entries(latest["content"], FINDINGS_MARKER)
+        content = latest["content"]
+        current_entries = _extract_entries(content, FINDINGS_MARKER)
         new_entries = new_lines if _is_empty_placeholder(current_entries) else f"{current_entries.rstrip()}\n{new_lines}"
-        new_content = _replace_entries(latest["content"], FINDINGS_MARKER, new_entries)
+        content = _replace_entries(content, FINDINGS_MARKER, new_entries)
+
+        corrected_kns = []
+        for correction in self._check_known_issue_contradictions(insights, content):
+            updated = _replace_known_issue(content, correction["kn"], correction["corrected_block"])
+            if updated is not False:
+                content = updated
+                corrected_kns.append(f"{correction['kn']} ({correction['reason']})")
 
         next_version = latest["version"] + 1
         changelog = f"Added {len(insights)} analytical finding(s){source_note}"
-        self._insert_version(content=new_content, version=next_version, changelog_summary=changelog)
+        if corrected_kns:
+            changelog += f"; corrected known issue(s): {', '.join(corrected_kns)}"
+        self._insert_version(content=content, version=next_version, changelog_summary=changelog)
         print(f"Updated business context to version {next_version}: {changelog}")
         return next_version
+
+    def _check_known_issue_contradictions(self, insights: list, content: str) -> list[dict]:
+        """One LLM call, batched across the whole insight set: does any
+        insight directly contradict a Section 5 known issue? Returns
+        corrections with a valid kn/corrected_block; anything malformed is
+        dropped rather than risking a bad splice into Section 5."""
+        known_issues = _extract_section_by_heading(content, "Known-issues log")
+        if not known_issues.strip():
+            return []
+
+        findings_text = "\n".join(
+            f"- [{getattr(i, 'severity', 'info')}] {getattr(i, 'title', '')}: {getattr(i, 'description', '')}"
+            for i in insights
+        )
+        prompt = KNOWN_ISSUE_CORRECTION_PROMPT.format(known_issues=known_issues, findings=findings_text)
+        parsed = self._call_llm_json(prompt, "context_known_issue_check")
+        if not isinstance(parsed, dict):
+            return []
+        corrections = parsed.get("corrections", [])
+        if not isinstance(corrections, list):
+            return []
+        return [
+            c for c in corrections
+            if isinstance(c, dict) and c.get("kn") and str(c.get("corrected_block", "")).strip()
+        ]
 
 
 if __name__ == "__main__":

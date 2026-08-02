@@ -107,6 +107,11 @@ not computable from the funnel tables here.)
 
 ## 5. Known-issues log
 
+> **Mandatory:** this log reflects current reality, not history. If a query result from
+> AnalyticsAgent contradicts a known issue below, that issue must be corrected using
+> AnalyticsAgent's findings, not left to go stale — `ContextAgent.add_analytical_findings()`
+> checks for this automatically on every analysis run.
+
 1. **K1 — iOS WebKit OTP autofill regression.** On recent iOS builds the payment OTP
    field fails to autofill, and some users abandon at the pay step. Payment-heavy
    geos (Gulf card users) may be at risk. Watch `pay_now_clicked → purchase_completed` for iOS.
